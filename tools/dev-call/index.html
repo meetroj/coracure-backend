@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Coracure — M-14 dev call</title>
+    <script src="https://cdn.jsdelivr.net/npm/livekit-client@2.15.4/dist/livekit-client.umd.min.js"></script>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #0f1115;
+        --panel: #171a21;
+        --line: #262b36;
+        --text: #e7eaf0;
+        --dim: #99a1b3;
+        --ok: #3ecf8e;
+        --bad: #f2777a;
+        --accent: #6ea8fe;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+      }
+      header {
+        padding: 14px 20px;
+        border-bottom: 1px solid var(--line);
+        display: flex;
+        gap: 14px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      h1 { font-size: 15px; margin: 0; font-weight: 600; }
+      .tag {
+        font-size: 11px;
+        padding: 2px 8px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        color: var(--dim);
+      }
+      main { display: grid; grid-template-columns: 1fr 360px; gap: 18px; padding: 18px 20px; }
+      @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+      .tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+      @media (max-width: 620px) { .tiles { grid-template-columns: 1fr; } }
+      .tile {
+        position: relative;
+        background: #000;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        overflow: hidden;
+        aspect-ratio: 4 / 3;
+      }
+      .tile video { width: 100%; height: 100%; object-fit: cover; display: block; }
+      .tile .label {
+        position: absolute;
+        left: 8px;
+        bottom: 8px;
+        background: rgba(0, 0, 0, 0.6);
+        padding: 2px 8px;
+        border-radius: 6px;
+        font-size: 12px;
+      }
+      .tile .empty {
+        position: absolute;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        color: var(--dim);
+        font-size: 13px;
+      }
+      aside { display: flex; flex-direction: column; gap: 14px; }
+      .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+      .panel h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--dim); margin: 0 0 10px; }
+      label { display: block; font-size: 12px; color: var(--dim); margin-bottom: 4px; }
+      select, input, button {
+        font: inherit;
+        background: #0d1016;
+        color: var(--text);
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        padding: 7px 10px;
+        width: 100%;
+      }
+      button { cursor: pointer; }
+      button:hover:not(:disabled) { border-color: var(--accent); }
+      button:disabled { opacity: 0.45; cursor: not-allowed; }
+      .row { display: flex; gap: 8px; }
+      .row > * { flex: 1; }
+      .primary { background: var(--accent); color: #08101f; border-color: var(--accent); font-weight: 600; }
+      .field { margin-bottom: 10px; }
+      .meter { height: 6px; background: #0d1016; border-radius: 999px; overflow: hidden; border: 1px solid var(--line); }
+      .meter > i { display: block; height: 100%; width: 0; background: var(--ok); transition: width 0.08s linear; }
+      dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; margin: 0; font-size: 12px; }
+      dt { color: var(--dim); }
+      dd { margin: 0; word-break: break-all; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      #log {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 11.5px;
+        white-space: pre-wrap;
+        max-height: 240px;
+        overflow: auto;
+        margin: 0;
+        color: var(--dim);
+      }
+      #log b { color: var(--ok); font-weight: 500; }
+      #log i { color: var(--bad); font-style: normal; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Coracure M-14 — development call</h1>
+      <span class="tag" id="role-tag">not joined</span>
+      <span class="tag">tokens come from the real API, not from this page</span>
+    </header>
+
+    <main>
+      <section>
+        <div class="tiles">
+          <div class="tile">
+            <video id="local" autoplay muted playsinline></video>
+            <div class="empty" id="local-empty">your camera</div>
+            <div class="label" id="local-label">you</div>
+          </div>
+          <div class="tile">
+            <video id="remote" autoplay playsinline></video>
+            <div class="empty" id="remote-empty">waiting for the other party</div>
+            <div class="label" id="remote-label">—</div>
+          </div>
+        </div>
+      </section>
+
+      <aside>
+        <div class="panel">
+          <h2>1 · Who are you</h2>
+          <div class="field">
+            <label for="role">Join this consultation as</label>
+            <select id="role">
+              <option value="patient">Patient (+919000000001)</option>
+              <option value="doctor">Doctor (+919000000002)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="consultation">Consultation id</label>
+            <input id="consultation" value="33333333-3333-4333-8333-333333333333" />
+          </div>
+        </div>
+
+        <div class="panel">
+          <h2>2 · Pre-call check (FR-8.2)</h2>
+          <div class="field">
+            <label for="cam">Camera</label>
+            <select id="cam"></select>
+          </div>
+          <div class="field">
+            <label for="mic">Microphone</label>
+            <select id="mic"></select>
+          </div>
+          <div class="field">
+            <label>Microphone level — say something</label>
+            <div class="meter"><i id="level"></i></div>
+          </div>
+          <button id="check">Run the device check</button>
+        </div>
+
+        <div class="panel">
+          <h2>3 · The call</h2>
+          <div class="row" style="margin-bottom: 8px">
+            <button id="join" class="primary">Join</button>
+            <button id="leave" disabled>Leave</button>
+          </div>
+          <div class="row">
+            <button id="mute" disabled>Mute</button>
+            <button id="camera" disabled>Camera off</button>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h2>What the backend issued</h2>
+          <dl id="ticket">
+            <dt>room</dt><dd>—</dd>
+          </dl>
+        </div>
+
+        <div class="panel">
+          <h2>Log</h2>
+          <pre id="log"></pre>
+        </div>
+      </aside>
+    </main>
+
+    <script>
+      const API = 'http://localhost:3000/api/v1';
+      const $ = (id) => document.getElementById(id);
+      const LK = window.LivekitClient;
+
+      let room = null;
+      let preview = null;
+      let audioCtx = null;
+
+      function log(message, kind) {
+        const tag = kind === 'ok' ? 'b' : kind === 'bad' ? 'i' : 'span';
+        $('log').insertAdjacentHTML(
+          'beforeend',
+          `<${tag}>${new Date().toLocaleTimeString()}  ${message}</${tag}>\n`,
+        );
+        $('log').scrollTop = $('log').scrollHeight;
+      }
+
+      async function api(path, options = {}) {
+        const response = await fetch(API + path, {
+          ...options,
+          headers: { 'content-type': 'application/json', ...(options.headers || {}) },
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(`${response.status} ${body.code || ''} ${body.message || ''}`);
+        return body;
+      }
+
+      /* Signs in through the real OTP flow (stub provider, fixed code), accepts
+         the teleconsultation consent M-03 requires of both sides, and asks the
+         real endpoint for a join token. This page mints nothing itself. */
+      async function authenticate(role) {
+        const mobile = role === 'patient' ? '+919000000001' : '+919000000002';
+        await api(`/auth/${role}/otp/request`, {
+          method: 'POST',
+          body: JSON.stringify({ mobileNumber: mobile }),
+        });
+        const session = await api(`/auth/${role}/otp/verify`, {
+          method: 'POST',
+          body: JSON.stringify({ mobileNumber: mobile, challengeId: mobile, code: '000000' }),
+        });
+        log(`signed in as ${role}`, 'ok');
+        const auth = { authorization: `Bearer ${session.accessToken}` };
+        await api('/legal/consents', {
+          method: 'POST',
+          headers: auth,
+          body: JSON.stringify({ documentType: 'teleconsultation_consent' }),
+        }).catch(() => {});
+        return auth;
+      }
+
+      async function listDevices() {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        for (const [kind, select] of [
+          ['videoinput', $('cam')],
+          ['audioinput', $('mic')],
+        ]) {
+          select.innerHTML = '';
+          devices
+            .filter((d) => d.kind === kind)
+            .forEach((d, i) => {
+              const option = document.createElement('option');
+              option.value = d.deviceId;
+              option.textContent = d.label || `${kind} ${i + 1}`;
+              select.appendChild(option);
+            });
+        }
+      }
+
+      /* FR-8.2. Camera, microphone and permission, checked BEFORE a token is
+         asked for - the token lives five minutes and the check should not
+         spend any of them. */
+      $('check').onclick = async () => {
+        try {
+          preview?.getTracks().forEach((t) => t.stop());
+          preview = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+          $('local').srcObject = preview;
+          $('local-empty').style.display = 'none';
+          await listDevices();
+
+          audioCtx = audioCtx || new AudioContext();
+          const analyser = audioCtx.createAnalyser();
+          analyser.fftSize = 512;
+          audioCtx.createMediaStreamSource(preview).connect(analyser);
+          const data = new Uint8Array(analyser.frequencyBinCount);
+          (function tick() {
+            analyser.getByteTimeDomainData(data);
+            const peak = Math.max(...data.map((v) => Math.abs(v - 128))) / 128;
+            $('level').style.width = `${Math.min(100, peak * 220)}%`;
+            requestAnimationFrame(tick);
+          })();
+
+          log('camera and microphone available, permission granted', 'ok');
+          const readiness = await api(
+            `/consultations/${$('consultation').value}/video/readiness`,
+            { headers: await authenticate($('role').value) },
+          );
+          log(
+            readiness.joinable
+              ? `backend says joinable, server ${readiness.serverUrl}`
+              : `backend says NOT joinable: ${readiness.reason} — ${readiness.message}`,
+            readiness.joinable ? 'ok' : 'bad',
+          );
+        } catch (error) {
+          log(`device check failed: ${error.message}`, 'bad');
+        }
+      };
+
+      $('join').onclick = async () => {
+        try {
+          const role = $('role').value;
+          const auth = await authenticate(role);
+          const ticket = await api(`/consultations/${$('consultation').value}/video/token`, {
+            method: 'POST',
+            headers: auth,
+          });
+          $('ticket').innerHTML = `
+            <dt>room</dt><dd>${ticket.roomName}</dd>
+            <dt>identity</dt><dd>${ticket.identity}</dd>
+            <dt>server</dt><dd>${ticket.serverUrl}</dd>
+            <dt>expires</dt><dd>${ticket.expiresInSeconds}s</dd>
+            <dt>publish</dt><dd>${ticket.canPublish}</dd>
+            <dt>subscribe</dt><dd>${ticket.canSubscribe}</dd>`;
+          log(`token issued for ${ticket.identity} on ${ticket.roomName}`, 'ok');
+
+          preview?.getTracks().forEach((t) => t.stop());
+          room = new LK.Room({ adaptiveStream: true, dynacast: true });
+
+          room.on(LK.RoomEvent.TrackSubscribed, (track, _pub, participant) => {
+            if (track.kind === 'video') {
+              track.attach($('remote'));
+              $('remote-empty').style.display = 'none';
+            } else {
+              track.attach();
+            }
+            $('remote-label').textContent = participant.identity;
+            log(`receiving ${participant.identity}'s ${track.kind}`, 'ok');
+          });
+          room.on(LK.RoomEvent.ParticipantDisconnected, (p) => {
+            log(`${p.identity} left the call`);
+            $('remote-empty').style.display = 'grid';
+            $('remote-label').textContent = '—';
+          });
+          room.on(LK.RoomEvent.Disconnected, (reason) => log(`disconnected (${reason ?? 'client'})`));
+
+          await room.connect(ticket.serverUrl, ticket.token);
+          await room.localParticipant.enableCameraAndMicrophone();
+          const camera = room.localParticipant.getTrackPublication(LK.Track.Source.Camera);
+          camera?.videoTrack?.attach($('local'));
+          $('local-empty').style.display = 'none';
+          $('local-label').textContent = `you (${ticket.identity})`;
+          $('role-tag').textContent = `in the call as ${ticket.identity}`;
+
+          $('join').disabled = true;
+          ['leave', 'mute', 'camera'].forEach((id) => ($(id).disabled = false));
+          log('joined — publishing camera and microphone', 'ok');
+        } catch (error) {
+          log(`join failed: ${error.message}`, 'bad');
+        }
+      };
+
+      /* FR-8.3. Both sides get mute and camera controls. */
+      $('mute').onclick = async () => {
+        const on = room.localParticipant.isMicrophoneEnabled;
+        await room.localParticipant.setMicrophoneEnabled(!on);
+        $('mute').textContent = on ? 'Unmute' : 'Mute';
+        log(on ? 'microphone muted' : 'microphone live');
+      };
+
+      $('camera').onclick = async () => {
+        const on = room.localParticipant.isCameraEnabled;
+        await room.localParticipant.setCameraEnabled(!on);
+        $('camera').textContent = on ? 'Camera on' : 'Camera off';
+        log(on ? 'camera off' : 'camera on');
+      };
+
+      $('leave').onclick = async () => {
+        await room?.disconnect();
+        $('join').disabled = false;
+        ['leave', 'mute', 'camera'].forEach((id) => ($(id).disabled = true));
+        $('role-tag').textContent = 'not joined';
+        $('remote-empty').style.display = 'grid';
+        log('left the call');
+      };
+
+      listDevices();
+      log('ready. run the device check, then join. open this page twice - once as each party.');
+    </script>
+  </body>
+</html>

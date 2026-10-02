@@ -1,0 +1,1411 @@
+# LiveKit Self-Hosted Integration — Backend Implementation Plan
+
+## 1. Objective
+
+Integrate self-hosted LiveKit into our backend product.
+
+The backend is built with:
+
+* Node.js
+* TypeScript
+* Fastify
+* PostgreSQL
+* Redis may already exist for application purposes
+
+The immediate goal is to:
+
+1. Run LiveKit locally.
+2. Integrate LiveKit with the Fastify backend.
+3. Implement authentication and authorization through our backend.
+4. Generate LiveKit access tokens from the backend.
+5. Connect meetings/rooms in our database with LiveKit rooms.
+6. Test the complete flow locally.
+7. Containerize the setup in a production-friendly way.
+8. Later deploy the same LiveKit setup to AWS EC2.
+9. Avoid introducing Redis for LiveKit clustering until multiple LiveKit nodes are actually required.
+
+---
+
+# 2. Important Architectural Principle
+
+LiveKit is NOT part of the Fastify process.
+
+LiveKit Server is a separate server application.
+
+The architecture is:
+
+```
+Client
+   |
+   | HTTPS/API
+   v
+Fastify Backend
+   |
+   | authentication
+   | authorization
+   | meeting permissions
+   | LiveKit token generation
+   |
+   v
+LiveKit Server
+   |
+   | WebRTC
+   |
+   v
+Meeting Participants
+```
+
+Fastify = application/control plane.
+
+LiveKit = realtime communication/media plane.
+
+The Fastify backend must NOT carry the actual audio/video traffic.
+
+---
+
+# 3. What LiveKit Does
+
+LiveKit Server handles the realtime communication infrastructure.
+
+It is responsible for:
+
+* WebRTC signaling
+* WebRTC connections
+* SFU/media forwarding
+* Rooms
+* Participants
+* Audio tracks
+* Video tracks
+* Screen sharing
+* Media subscriptions
+* Network negotiation
+* NAT traversal
+* TURN support
+* Realtime participant communication
+
+We should NOT implement our own:
+
+* WebRTC SFU
+* media router
+* RTP forwarding
+* signaling protocol
+* TURN infrastructure
+* media transport layer
+
+LiveKit provides this functionality.
+
+---
+
+# 4. LiveKit Server vs LiveKit SDK
+
+There are two different concepts.
+
+## LiveKit Server
+
+This is the actual realtime server.
+
+It runs as a separate process/container.
+
+Example:
+
+```
+Docker
+   |
+   +-- LiveKit Server
+```
+
+It is NOT installed into the Fastify process.
+
+## livekit-server-sdk
+
+This is a backend SDK/library.
+
+Our Fastify application will use it to:
+
+* generate LiveKit access tokens
+* call LiveKit server APIs when required
+* interact programmatically with LiveKit
+
+For Node.js:
+
+```
+npm install livekit-server-sdk
+```
+
+The SDK does NOT itself become the media server.
+
+---
+
+# 5. Authentication Architecture
+
+Users authenticate with OUR application.
+
+There is no requirement for users to register/login to LiveKit.
+
+Self-hosted LiveKit does not require a LiveKit Cloud account.
+
+We own the LiveKit deployment.
+
+The authentication flow should be:
+
+```
+User
+  |
+  v
+Our Fastify authentication
+  |
+  v
+Validate user
+  |
+  v
+Check meeting membership
+  |
+  v
+Determine role/permissions
+  |
+  v
+Generate LiveKit access token
+  |
+  v
+Return token
+  |
+  v
+Client connects to our LiveKit server
+```
+
+The LiveKit API key and API secret belong to our self-hosted LiveKit deployment.
+
+They must NEVER be exposed to the client.
+
+Only the Fastify backend should have access to the LiveKit API secret.
+
+---
+
+# 6. Local Development Architecture
+
+Initially use a single LiveKit server.
+
+Do NOT build a distributed LiveKit cluster.
+
+Local architecture:
+
+```
+Local Machine
+
++-------------------------------+
+|                               |
+|   Fastify Backend             |
+|        |                      |
+|        | LiveKit SDK           |
+|        |                      |
+|        v                      |
+|   LiveKit Server              |
+|                               |
+|   PostgreSQL                   |
+|                               |
++-------------------------------+
+```
+
+Redis is NOT required for the initial single-node LiveKit deployment.
+
+The existing application Redis can continue to serve application purposes if the project already uses it.
+
+Do not add another Redis dependency solely for LiveKit at this stage.
+
+---
+
+# 7. Why Redis Is Not Needed Initially
+
+A single LiveKit server can operate independently.
+
+Redis becomes important when we run multiple LiveKit nodes.
+
+For example:
+
+```
+Load Balancer
+     |
++----+----+
+|    |    |
+v    v    v
+```
+
+LK1  LK2  LK3
+\    |    /
+\   |   /
+Redis
+
+Redis is used by distributed LiveKit deployments for shared coordination and messaging.
+
+Redis is NOT part of the audio/video media path.
+
+Do NOT design:
+
+```
+User
+  |
+LiveKit
+  |
+Redis
+  |
+LiveKit
+  |
+User
+```
+
+That is incorrect.
+
+The media path is:
+
+```
+User
+  |
+  | WebRTC
+  v
+LiveKit
+  |
+  | WebRTC
+  v
+Other User
+```
+
+Redis is a coordination mechanism between LiveKit nodes.
+
+Therefore:
+
+LOCAL:
+
+```
+Fastify
+   +
+LiveKit
+   +
+PostgreSQL
+```
+
+Later, when scaling:
+
+```
+Fastify
+   +
+Load Balancer
+   +
+Multiple LiveKit nodes
+   +
+Redis
+```
+
+---
+
+# 8. Database Responsibility
+
+PostgreSQL remains the source of truth for our application.
+
+LiveKit should NOT become our application's main database.
+
+Our database should store things such as:
+
+```
+users
+meetings
+meeting_members
+roles
+permissions
+```
+
+Suggested conceptual structure:
+
+```
+users
+----------------
+id
+name
+...
+
+meetings
+----------------
+id
+room_name
+created_by
+status
+created_at
+...
+
+meeting_members
+----------------
+meeting_id
+user_id
+role
+...
+```
+
+The exact schema should follow the existing project's conventions.
+
+---
+
+# 9. Mapping Application Meetings to LiveKit Rooms
+
+Every application meeting should have a corresponding LiveKit room.
+
+Example:
+
+```
+PostgreSQL
+
+meeting:
+    id = 123
+    room_name = "meeting-123"
+
+LiveKit:
+
+    room = "meeting-123"
+```
+
+The database owns the application's meeting.
+
+LiveKit owns the realtime room.
+
+The Fastify backend connects the two.
+
+---
+
+# 10. Token Endpoint
+
+Implement an endpoint conceptually equivalent to:
+
+```
+POST /meetings/:meetingId/token
+```
+
+The exact route should follow the existing project's API conventions.
+
+Flow:
+
+```
+Request
+   |
+   v
+Fastify authentication
+   |
+   v
+Get authenticated user
+   |
+   v
+Load meeting from PostgreSQL
+   |
+   v
+Verify user is allowed to join
+   |
+   v
+Determine user's meeting role
+   |
+   v
+Determine LiveKit permissions
+   |
+   v
+Generate LiveKit access token
+   |
+   v
+Return token + LiveKit URL
+```
+
+---
+
+# 11. LiveKit Token Permissions
+
+Use LiveKit access grants appropriately.
+
+Important grants include:
+
+```
+roomJoin
+room
+canPublish
+canSubscribe
+```
+
+For example, a normal participant might receive:
+
+```
+roomJoin: true
+room: "meeting-123"
+canPublish: true
+canSubscribe: true
+```
+
+A listener-only participant might receive:
+
+```
+roomJoin: true
+room: "meeting-123"
+canPublish: false
+canSubscribe: true
+```
+
+The actual permission model must be derived from our application's existing roles.
+
+Do not blindly give every participant maximum permissions.
+
+---
+
+# 12. Example Backend Logic
+
+Conceptually:
+
+```
+authenticate request
+
+user = request.user
+
+meeting = database.findMeeting(meetingId)
+
+if meeting does not exist:
+    return 404
+
+membership = database.findMeetingMember(
+    meetingId,
+    user.id
+)
+
+if membership does not exist:
+    return 403
+
+permissions = mapApplicationRoleToLiveKitPermissions(
+    membership.role
+)
+
+token = new AccessToken(
+    LIVEKIT_API_KEY,
+    LIVEKIT_API_SECRET,
+    {
+        identity: user.id
+    }
+)
+
+token.addGrant({
+    roomJoin: true,
+    room: meeting.roomName,
+    canPublish: permissions.canPublish,
+    canSubscribe: permissions.canSubscribe
+})
+
+return:
+    token
+    livekitUrl
+```
+
+Use the project's existing authentication, error handling, validation, logging, and service/repository architecture.
+
+Do not create an unrelated parallel architecture.
+
+---
+
+# 13. Environment Variables
+
+Use environment variables/secrets.
+
+Conceptually:
+
+```
+LIVEKIT_URL=ws://localhost:7880
+LIVEKIT_API_KEY=...
+LIVEKIT_API_SECRET=...
+```
+
+Production will later use something similar to:
+
+```
+LIVEKIT_URL=wss://livekit.example.com
+LIVEKIT_API_KEY=production-key
+LIVEKIT_API_SECRET=production-secret
+```
+
+The exact production secret-management mechanism should be selected during AWS deployment.
+
+Never hardcode secrets.
+
+Never commit secrets to Git.
+
+Never return the API secret to clients.
+
+---
+
+# 14. Local LiveKit Setup
+
+First get LiveKit running locally.
+
+There are two acceptable approaches:
+
+1. LiveKit's local development mode.
+2. Docker-based deployment.
+
+Prefer Docker/configuration that can be carried forward to AWS where practical.
+
+The objective is to avoid creating a completely different local architecture from production.
+
+Local target:
+
+```
+Fastify
+    |
+    v
+LiveKit Server
+    |
+    v
+WebRTC clients
+```
+
+The machine only needs to support development-level testing.
+
+A 4 GB RAM development machine is acceptable for basic development and a small number of participants.
+
+Do NOT use the local machine for production-scale load testing.
+
+---
+
+# 15. Docker Strategy
+
+Use Docker to make the environment reproducible.
+
+The exact repository structure should follow the existing project.
+
+Conceptually:
+
+```
+project/
+|
++-- backend/
+|     |
+|     +-- src/
+|     +-- package.json
+|     +-- Dockerfile
+|
++-- livekit/
+|     |
+|     +-- livekit.yaml
+|     +-- docker-compose.yml
+|
++-- ...
+```
+
+Do not unnecessarily restructure the existing project.
+
+The LiveKit production deployment configuration should be generated/derived from the official LiveKit deployment approach rather than inventing an unsupported configuration.
+
+---
+
+# 16. AWS Deployment Target
+
+After local development is working, deploy LiveKit to AWS.
+
+Initial target:
+
+```
+AWS
+  |
+  +-- EC2
+        |
+        +-- Docker
+              |
+              +-- LiveKit Server
+              |
+              +-- Caddy
+              |
+              +-- optional supporting services
+```
+
+Start with ONE LiveKit node.
+
+Do not introduce:
+
+* EKS
+* Kubernetes
+* multiple LiveKit nodes
+* distributed Redis
+* multi-region deployment
+
+until the product actually requires them.
+
+---
+
+# 17. AWS EC2
+
+Create an EC2 instance for LiveKit.
+
+Use a current Ubuntu LTS image.
+
+Start with a reasonable compute/network configuration and benchmark actual workload before choosing production sizing.
+
+Do not claim that a specific EC2 instance size is universally sufficient.
+
+LiveKit capacity depends heavily on:
+
+* number of participants
+* number of rooms
+* video resolution
+* bitrate
+* publishing/subscribing patterns
+* CPU
+* network bandwidth
+
+The initial EC2 is for getting the architecture running.
+
+Production sizing should be based on realistic load tests.
+
+---
+
+# 18. AWS Static/Public Networking
+
+LiveKit requires public network reachability.
+
+Configure:
+
+* public IPv4 or Elastic IP as appropriate
+* DNS
+* EC2 Security Group
+* WebRTC UDP connectivity
+* WebRTC TCP fallback
+* TURN connectivity
+
+Example domain:
+
+```
+livekit.example.com
+```
+
+Optional TURN domain:
+
+```
+turn.example.com
+```
+
+---
+
+# 19. DNS
+
+Use Route 53 or the project's existing DNS provider.
+
+Create:
+
+```
+livekit.example.com
+```
+
+pointing to the LiveKit deployment.
+
+The final client-facing endpoint should be conceptually:
+
+```
+wss://livekit.example.com
+```
+
+Do not expose an insecure HTTP LiveKit endpoint as the production client endpoint.
+
+---
+
+# 20. TLS
+
+Production LiveKit should use trusted TLS.
+
+Use Caddy as the reverse proxy/TLS termination layer following the official LiveKit VM deployment approach.
+
+Conceptually:
+
+```
+Internet
+    |
+    | HTTPS/WSS :443
+    v
+Caddy
+    |
+    | internal
+    v
+LiveKit :7880
+```
+
+Caddy handles TLS certificates and reverse proxying.
+
+---
+
+# 21. Important LiveKit Network Ports
+
+The deployment must follow the current official LiveKit port requirements.
+
+Typical configuration includes:
+
+```
+7880
+    HTTP/API/signaling
+
+7881
+    WebRTC TCP
+
+50000-60000 UDP
+    WebRTC media
+```
+
+TURN-related ports depend on the chosen TURN configuration.
+
+Configure AWS Security Groups according to the exact LiveKit configuration being deployed.
+
+Do not blindly expose unnecessary ports.
+
+---
+
+# 22. External IP Configuration
+
+AWS EC2 commonly has a private interface address while clients reach the server through a public IP.
+
+LiveKit must be configured appropriately for cloud environments so WebRTC advertises a reachable external address.
+
+Use the appropriate LiveKit external-IP configuration.
+
+Validate this during WebRTC testing.
+
+---
+
+# 23. TURN
+
+TURN is required for clients that cannot establish a suitable direct UDP/WebRTC path because of NAT or restrictive firewalls.
+
+Conceptually:
+
+Normal:
+
+```
+Client
+   |
+   | UDP
+   v
+LiveKit
+```
+
+Restricted network:
+
+```
+Client
+   |
+   | TURN/TLS
+   v
+TURN
+   |
+   v
+LiveKit
+```
+
+Use LiveKit's supported embedded TURN configuration where appropriate.
+
+Test TURN from a restrictive network, not only from the same local network.
+
+---
+
+# 24. AWS Security Group
+
+Configure inbound rules based on the actual deployment.
+
+Typical requirements include:
+
+```
+80/TCP
+443/TCP
+7881/TCP
+WebRTC UDP range
+TURN ports as configured
+```
+
+SSH access should be restricted rather than opened broadly whenever practical.
+
+The WebRTC media range needs special attention because media traffic does not behave like a normal REST API.
+
+---
+
+# 25. Fastify → LiveKit AWS Integration
+
+The Fastify code should continue using the LiveKit SDK.
+
+Only configuration should change.
+
+Local:
+
+```
+LIVEKIT_URL=ws://localhost:7880
+```
+
+Production:
+
+```
+LIVEKIT_URL=wss://livekit.example.com
+```
+
+The token-generation service should remain essentially identical.
+
+This is a core design objective:
+
+```
+SAME APPLICATION LOGIC
+
+Local:
+    Fastify → local LiveKit
+
+AWS:
+    Fastify → AWS LiveKit
+```
+
+---
+
+# 26. Deployment Architecture
+
+Initial AWS architecture:
+
+```
+                     Internet
+                        |
+            +-----------+-----------+
+            |                       |
+            v                       v
+     Fastify Backend          livekit.example.com
+            |                       |
+            |                       v
+            |                     Caddy
+            |                       |
+            |                       v
+            |                   LiveKit EC2
+            |
+            v
+        PostgreSQL
+```
+
+LiveKit media:
+
+```
+    Participant A
+          |
+          | WebRTC
+          v
+      LiveKit SFU
+          |
+          | WebRTC
+          v
+    Participant B
+```
+
+Fastify is NOT in the media path.
+
+---
+
+# 27. Production Scaling Architecture — Later
+
+Only when required:
+
+```
+                     Load Balancer
+                          |
+            +-------------+-------------+
+            |             |             |
+            v             v             v
+          LK-1          LK-2          LK-3
+            |             |             |
+            +-------------+-------------+
+                          |
+                        Redis
+```
+
+Redis coordinates the LiveKit cluster.
+
+The actual WebRTC media is handled by LiveKit nodes, not Redis.
+
+Do not implement this architecture until single-node operation is stable.
+
+---
+
+# 28. Recording / Egress — Later Phase
+
+Recording is not part of the initial LiveKit deployment.
+
+If the product requires recordings:
+
+```
+LiveKit
+   |
+   v
+Egress
+   |
+   v
+S3
+   |
+   v
+Application/download system
+```
+
+Treat Egress as a separate later infrastructure component.
+
+Do not add it merely because LiveKit supports it.
+
+---
+
+# 29. Observability
+
+Once the basic deployment works, add:
+
+* structured logs
+* LiveKit server logs
+* Fastify logs
+* health checks
+* metrics
+* Prometheus where appropriate
+* CloudWatch integration
+* CPU monitoring
+* memory monitoring
+* network monitoring
+* disk monitoring
+* alerts
+
+Important operational metrics should eventually include:
+
+* active rooms
+* active participants
+* CPU utilization
+* network throughput
+* packet loss
+* connection failures
+* TURN usage
+* server restarts
+* latency-related indicators
+
+---
+
+# 30. Testing Plan
+
+## Test 1 — Server startup
+
+Verify LiveKit starts successfully.
+
+## Test 2 — Fastify token generation
+
+Call:
+
+```
+POST /meetings/:meetingId/token
+```
+
+Verify:
+
+* authenticated user required
+* meeting exists
+* membership is checked
+* unauthorized users are rejected
+* correct LiveKit permissions are generated
+
+## Test 3 — Room connection
+
+Verify the generated token allows joining the correct room.
+
+## Test 4 — Permissions
+
+Test:
+
+```
+host
+participant
+listener/read-only
+unauthorized user
+```
+
+Verify each receives correct permissions.
+
+## Test 5 — Multiple participants
+
+Test:
+
+```
+User A
+User B
+User C
+```
+
+in the same LiveKit room.
+
+## Test 6 — Audio/video
+
+Verify normal WebRTC communication.
+
+## Test 7 — Network restrictions
+
+Test through:
+
+* normal home network
+* mobile hotspot
+* restrictive network
+
+Verify TURN fallback.
+
+## Test 8 — Server restart
+
+Restart LiveKit and verify expected behavior.
+
+## Test 9 — Token expiration
+
+Verify expired/invalid tokens are rejected.
+
+## Test 10 — Load testing
+
+Only after functional correctness is established.
+
+Benchmark realistic:
+
+* concurrent rooms
+* concurrent participants
+* publishers
+* subscribers
+* video resolutions
+* network bandwidth
+* CPU usage
+
+---
+
+# 31. Security Requirements
+
+Never expose:
+
+```
+LIVEKIT_API_SECRET
+```
+
+to the client.
+
+Never commit:
+
+```
+.env
+```
+
+or production secrets.
+
+Use secure secret management for AWS production.
+
+Use TLS.
+
+Restrict EC2 SSH access.
+
+Use least-privilege IAM.
+
+Restrict Security Group rules.
+
+Keep LiveKit and OS versions updated.
+
+Separate development and production credentials.
+
+Do not reuse development API secrets in production.
+
+---
+
+# 32. Development → AWS Migration Strategy
+
+The migration should NOT involve rewriting the backend.
+
+Local:
+
+```
+Fastify
+   |
+   v
+LiveKit localhost
+```
+
+AWS:
+
+```
+Fastify
+   |
+   v
+LiveKit AWS
+```
+
+The application code should remain unchanged.
+
+Only infrastructure/environment values change:
+
+```
+LOCAL
+
+LIVEKIT_URL=ws://localhost:7880
+
+
+PRODUCTION
+
+LIVEKIT_URL=wss://livekit.example.com
+```
+
+The API key and secret also change.
+
+---
+
+# 33. Recommended Implementation Sequence
+
+Implement in exactly this order unless an existing project constraint requires otherwise.
+
+### Phase 1 — Understand/inspect existing backend
+
+Inspect:
+
+* authentication
+* users
+* meetings
+* roles
+* permissions
+* database repositories/services
+* existing Redis
+* Docker setup
+* configuration management
+
+Do not duplicate existing abstractions.
+
+### Phase 2 — Local LiveKit
+
+Run one LiveKit server locally.
+
+Verify that it starts correctly.
+
+### Phase 3 — Backend SDK
+
+Install and configure:
+
+```
+livekit-server-sdk
+```
+
+Create a dedicated LiveKit service/module following existing backend architecture.
+
+### Phase 4 — Token endpoint
+
+Implement:
+
+```
+POST /meetings/:meetingId/token
+```
+
+with:
+
+```
+authentication
+authorization
+database lookup
+role mapping
+token generation
+```
+
+### Phase 5 — Permission model
+
+Map application roles to:
+
+```
+roomJoin
+canPublish
+canSubscribe
+```
+
+Add tests.
+
+### Phase 6 — Local integration testing
+
+Verify complete meeting flow.
+
+### Phase 7 — Docker
+
+Containerize the deployment in a reproducible way.
+
+### Phase 8 — AWS infrastructure
+
+Create:
+
+```
+EC2
+Elastic IP/public networking
+Security Group
+DNS
+TLS
+```
+
+### Phase 9 — AWS LiveKit
+
+Deploy LiveKit using the official VM/Docker deployment approach.
+
+Configure:
+
+```
+domain
+TLS
+WebRTC ports
+external IP
+TURN
+```
+
+### Phase 10 — AWS Fastify integration
+
+Point Fastify to:
+
+```
+wss://livekit.example.com
+```
+
+Use production credentials.
+
+### Phase 11 — Production testing
+
+Test:
+
+```
+connectivity
+WebRTC
+TURN
+permissions
+restarts
+concurrent participants
+```
+
+### Phase 12 — Observability
+
+Add monitoring and alerts.
+
+### Phase 13 — Scaling
+
+Only if workload requires it:
+
+```
+Redis
+   ↓
+multiple LiveKit nodes
+   ↓
+load balancing
+   ↓
+potentially EKS/multi-region
+```
+
+---
+
+# 34. Definition of Done
+
+The initial implementation is complete when:
+
+* LiveKit runs locally.
+* Fastify can communicate with LiveKit.
+* LiveKit credentials are stored securely.
+* The backend can generate LiveKit access tokens.
+* Meeting authorization is performed using our PostgreSQL data.
+* Application roles map correctly to LiveKit permissions.
+* Unauthorized users cannot obtain valid meeting tokens.
+* Clients can join the appropriate LiveKit room.
+* Multiple participants can communicate.
+* LiveKit is containerized.
+* LiveKit is deployed to AWS EC2.
+* DNS works.
+* TLS works.
+* WebRTC UDP connectivity works.
+* WebRTC TCP fallback works.
+* TURN works for restrictive networks.
+* Fastify works against the AWS LiveKit instance.
+* Logs and health monitoring exist.
+* Deployment and rollback procedures are documented.
+
+---
+
+# 35. Final Architecture
+
+Initial development:
+
+```
+                LOCAL MACHINE
+
+         +----------------------+
+         |    Fastify Backend   |
+         |                      |
+         | Auth                 |
+         | Meetings             |
+         | Permissions          |
+         | LiveKit SDK          |
+         +----------+-----------+
+                    |
+                    | Token/API
+                    v
+         +----------------------+
+         |    LiveKit Server    |
+         |                      |
+         | Signaling            |
+         | WebRTC               |
+         | SFU                  |
+         | TURN                 |
+         +----------------------+
+```
+
+Initial AWS:
+
+```
+                   AWS
+                    |
+      +-------------+-------------+
+      |                           |
+      v                           v
+```
+
+Fastify Backend              LiveKit EC2
+|                           |
+v                           v
+PostgreSQL                  Caddy/TLS
+|
+v
+LiveKit
+|
+v
+WebRTC
+
+Future scaling:
+
+```
+                   AWS
+                    |
+              Load Balancer
+                    |
+          +---------+---------+
+          |         |         |
+          v         v         v
+        LK-1      LK-2      LK-3
+          \         |         /
+           \        |        /
+                Redis
+```
+
+Fastify remains the application's control plane.
+
+LiveKit remains the realtime/media plane.
+
+PostgreSQL remains the application's source of truth.
+
+Redis is introduced for distributed LiveKit coordination when multiple LiveKit nodes are required.
+
+---
+
+# 36. Key Principles for Codex
+
+1. Do not implement WebRTC ourselves.
+2. Do not embed LiveKit Server inside Fastify.
+3. Use LiveKit Server as a separate service/container.
+4. Use livekit-server-sdk from Fastify for token generation/API interaction.
+5. Never expose LiveKit API secrets to clients.
+6. Authenticate users through our own backend.
+7. Authorize meeting access through our own database.
+8. Map application permissions to LiveKit grants.
+9. Do not put audio/video through Fastify.
+10. Do not put audio/video through Redis.
+11. Do not introduce Redis for LiveKit until distributed deployment is required.
+12. Start with one LiveKit node.
+13. Develop locally first.
+14. Keep local and AWS application logic as similar as possible.
+15. Use Docker to make the deployment reproducible.
+16. Deploy the first production LiveKit node on AWS EC2.
+17. Use DNS + trusted TLS + correct WebRTC networking.
+18. Test TURN explicitly.
+19. Benchmark before deciding EC2 sizing.
+20. Scale to Redis + multiple LiveKit nodes only when actual workload requires it.
+21. Do not introduce Kubernetes/EKS prematurely.
+22. Follow the current official LiveKit deployment documentation for exact production configuration and port requirements.
+23. Reuse the existing project's architecture, authentication, configuration, database, error handling, logging, and testing conventions rather than creating parallel systems.

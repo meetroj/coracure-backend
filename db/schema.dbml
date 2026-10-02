@@ -1,0 +1,1362 @@
+Project coracure {
+  database_type: 'PostgreSQL'
+  Note: '''
+    # Coracure - Database Schema
+
+    Psychiatry-first doctor consultation platform. 28 tables.
+
+    ## Three account tables, one per kind of person
+    `patients` - self sign-up by mobile OTP; Slide owns OTP challenge state
+    `doctors`  - never self-registers. An admin creates the account, the doctor
+                 uploads credentials to `doctor_documents`, an admin approves
+                 each one, then approves and lists the doctor.
+    `admins`   - created by another admin. Email and password, desktop browser.
+
+    ## No session state, and no session token either
+    There is no session table, no `session_*` columns, and no
+    `refresh_token_hash`. Revocation is a single `token_version smallint` on
+    each account row. Every issued token carries a `ver` claim; a token whose
+    `ver` does not equal the row `token_version` is refused. Revoking a login,
+    or signing every device out, is one increment. Expiry stays where it
+    already was - the access token `exp` claim and the refresh token lifetime -
+    so the database keeps no copy of it. The login IP address and user agent
+    are audit facts and live in `audit_log` where action = login, the one place
+    that already records every sign-in.
+
+    Push delivery goes through FCM for both platforms, so a device is
+    `push_token` plus `device_id` and nothing else. Admins have neither: the
+    panel is a desktop browser (SRS 2.3), and admin alerts are read in-panel
+    from `notifications`.
+
+    ## The spine
+    `consultations.id` IS the consultation ID. It absorbs the slot hold, the
+    follow-up plan and the patient feedback.
+
+    ## LiveKit
+    The room is not stored - it is named from `consultations.id`, so one room
+    per consultation holds by construction. The join token is not stored -
+    the backend mints it per request from `LIVEKIT_URL` plus the API secret in
+    the environment, grants it `canPublish` and `canSubscribe` on that one
+    room, and records the issue as an `audit_log` row. What IS stored is
+    `consultation_participants`, one row per WebRTC connection, written by the
+    LiveKit webhook. That is the whole of the integration's footprint here.
+
+    ## No derived columns
+    Nothing is stored that can be computed from something else already stored.
+    No `scheduled_end_at` (start + duration). No `subtotal` or `total_payable`
+    (fee + convenience + GST). No `livekit_room_name` (a function of the
+    consultation id). No `followup_ends_on` (start + pathway duration). No
+    `no_show_party` (the party with no `consultation_participants` row). No
+    call duration (sum the rows). No reliability counters (count the rows). A
+    stored copy is a second source of truth, and the two always drift apart
+    eventually.
+
+    ## No flag beside the timestamp that already says it
+    A two-state lifecycle is carried by its timestamp alone. `finalised_at`,
+    not `status` + `finalised_at`. `payout_paid_at`, not `payout_status` +
+    `payout_paid_at`. `deleted_at`, not `is_deleted` + `deleted_at`.
+    `referral_note`, not `referral_advised` + `referral_note`.
+    `acknowledged_at` / `closed_at`, not an alert `status` beside them. A
+    status column earns its place only where there are genuinely more than two
+    states: payments, complaints, clarifications, report requests, content
+    review, deletion requests and notifications keep theirs.
+
+    Child rows that are strictly 1:1 with a consultation (payments, clinical
+    records) do NOT repeat patient_id and doctor_id - they read through
+    `consultations`, so those facts have exactly one home.
+
+    ## Nothing stored for a screen that does not exist
+    Every column here is written by a flow in MODULES and read by a screen in
+    the SRS. Fields that were only ever plausible - a patient email with no
+    mail transport behind it, a doctor council name no listing shows, per-file
+    byte counts and mime types the object store already holds, hand-set sort
+    positions nothing sorts by, content locales while the app is
+    single-language - are gone.
+
+    ## External identity dependency
+    OTP generation, expiry and attempt state are owned by Slide, not by this
+    database. The successful verification fact is kept on `doctors` only
+    (`mobile_verified_at`), because an admin creates that row long before the
+    doctor first proves they hold the number; a `patients` row cannot exist
+    unverified, so there the column restated its own primary key. The platform
+    still enforces its OWN rate limit,
+    read from `audit_log` where action = login, because FR-1.9 makes that the
+    platform obligation regardless of what Slide does.
+
+    ## Conventions
+    - timestamptz everywhere, UTC
+    - uuid keys, except append-only logs which use bigserial
+    - money is numeric(10,2), INR
+
+    See RELATIONSHIPS at the bottom for every connection in one list.
+  '''
+}
+
+// ############################################################################
+// 1. PATIENTS
+// ############################################################################
+
+Enum account_status {
+  pending
+  active
+  suspended
+  deleted
+}
+
+Enum gender {
+  male
+  female
+  other
+  undisclosed
+}
+
+Table patients {
+  id uuid [pk, default: `gen_random_uuid()`]
+  status account_status [not null, default: 'pending']
+
+  mobile_number varchar(16) [not null, unique, note: 'the sign-in identifier, stored in E.164 form (+919876543210). FR-2.2 asks for contact, and this is it.']
+
+  full_name varchar(160)
+  date_of_birth date [note: 'age is derived from this, never stored']
+  gender gender [not null, default: 'undisclosed']
+  preferred_language varchar(40) [not null, default: 'en', note: '*** MATCHED ON *** a provider who does not speak this is never assigned - SRS FR-20.4']
+  region_id uuid [note: 'the state the patient is in. A PREFERENCE for assignment, relaxed when the region pool is empty - SRS FR-20.5']
+
+  // Revocation. Every token carries a `ver` claim; a token whose ver does not
+  // equal this is refused. Revoke, or sign out everywhere, by incrementing.
+  // Expiry is the token own exp claim. IP and user agent are in audit_log.
+  token_version smallint [not null, default: 0, note: '*** REVOCATION *** bump to invalidate every token issued for this account']
+
+  // Notification device. Replaced on every sign-in. FCM delivers to both iOS
+  // and Android, so the platform is not a column.
+  push_token text
+  device_id varchar(120) [note: 'named by FR-1.8']
+
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    status
+    push_token
+    (region_id, preferred_language) [note: 'the pair every assignment starts from']
+  }
+
+  Note: 'No password - patients authenticate by OTP only. No mobile_verified_at: a patient row is only ever written after Slide confirms the OTP, so the row existing IS the verification, and when it happened is created_at plus the audit_log row where action = login. No email: no requirement names one and the platform has no mail transport, so receipts stay with the gateway. No emergency contact either - FR-3.4 and 6.3 give emergency guidance as content, they do not collect a contact.'
+}
+
+// ############################################################################
+// 2. ADMINS
+//    Desktop browser only (SRS 2.3). No push token, no device id.
+// ############################################################################
+
+Enum admin_permission_level {
+  super_admin
+  operations
+  clinical_governance
+  care_coordinator
+  finance
+  content
+}
+
+Table admins {
+  id uuid [pk, default: `gen_random_uuid()`]
+  status account_status [not null, default: 'active']
+  email varchar(255) [not null, unique, note: 'the sign-in identifier']
+  password_hash text [not null]
+  is_2fa_enabled boolean [not null, default: false, note: 'when true, require an OTP challenge through Slide after password verification']
+  full_name varchar(160) [not null]
+  permission_level admin_permission_level [not null, note: 'gates which panel sections and data this admin sees']
+
+  token_version smallint [not null, default: 0, note: '*** REVOCATION *** bump to invalidate every token issued for this account']
+
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (permission_level, status)
+  }
+
+  Note: 'care_coordinator is the narrower level that receives safety and follow-up alerts, read in-panel from notifications. Who created this account is the audit_log row where action = create and entity_type = admin.'
+}
+
+// ############################################################################
+// 3. DOCTORS - separate account, separate registration
+//      1. admin creates the account            verification_status = pending
+//      2. doctor uploads papers                -> doctor_documents rows
+//      3. admin approves EACH document         review_status = approved
+//      4. admin approves the doctor            verification_status = verified
+//      5. admin lists the doctor               is_listed = true
+//    Only verified AND listed appears in search or takes a consult.
+// ############################################################################
+
+// Seniority. The SRS calls the top one "expert level".
+Enum doctor_seniority {
+  standard
+  expert
+}
+
+// ONE lifecycle enum. There is no second `status` column - suspension,
+// rejection and approval are all states of the same thing.
+Enum doctor_verification_status {
+  pending        [note: 'account created, papers not yet complete']
+  under_review   [note: 'papers submitted, admin checking']
+  verified       [note: 'approved - may be listed and consult']
+  rejected
+  suspended
+}
+
+Enum doctor_presence {
+  offline
+  available_now
+  request_pending
+  in_consultation
+  completing_notes
+  paused
+  scheduled_only
+}
+
+Table doctors {
+  id uuid [pk, default: `gen_random_uuid()`]
+
+  mobile_number varchar(16) [not null, unique, note: 'the sign-in identifier, stored in E.164 form (+919876543210) - doctors sign in by OTP, FR-1.2']
+  // Slide owns OTP generation, expiry and attempt state. Kept here and NOT on
+  // patients: an admin types this number in weeks before the doctor first
+  // signs in, so null here means nobody has yet proved they hold the number.
+  // A patient row cannot exist unverified, so there the column said nothing.
+  mobile_verified_at timestamptz [note: 'null = the doctor has never completed an OTP sign-in on this number']
+
+  token_version smallint [not null, default: 0, note: '*** REVOCATION *** bump to invalidate every token issued for this account']
+  push_token text
+  device_id varchar(120) [note: 'named by FR-1.8']
+
+  full_name varchar(160) [not null]
+  bio text [note: 'profile copy, FR-4.3']
+  languages jsonb [not null, default: `'[]'`, note: 'filtered on, FR-4.4']
+
+  verification_status doctor_verification_status [not null, default: 'pending']
+  registration_number varchar(80) [unique, note: 'medical council registration, shown in listings by FR-4.2']
+  qualification varchar(255)
+  years_of_experience smallint
+  verified_by_admin_id uuid [note: 'admin who approved the DOCTOR; each document is signed off separately. Read on every row of the approval queue, so it is not a join to audit_log.']
+  verified_at timestamptz
+
+  seniority_level doctor_seniority [not null, default: 'standard', note: 'admin-granted. expert is the only level that may be ASKED for a case opinion - it grants sight of nothing on its own.']
+  specialty_id uuid [note: 'one specialty. It decides prescribing eligibility.']
+  consultation_fee_inr numeric(10,2) [not null, default: 0, note: '*** WHAT THIS PROVIDER IS PAID, not what the patient is charged. *** The patient price is specialties.consultation_fee_inr, because a patient who cannot choose the provider must be quoted before one is assigned - SRS FR-7.8, FR-7.9']
+  consultation_duration_minutes smallint [not null, default: 30]
+  buffer_minutes smallint [not null, default: 5]
+  is_listed boolean [not null, default: false, note: 'admin toggle. Search needs verification_status = verified AND this true.']
+  allow_instant_consult boolean [not null, default: false]
+  bank_verified boolean [not null, default: false, note: 'admin-set once payout details are checked outside this system. No account number or IFSC is ever stored here.']
+
+  presence doctor_presence [not null, default: 'offline']
+  blocked_by_consultation_id uuid [note: '*** THE COMPLETION GATE *** set while documentation is outstanding']
+
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (verification_status, is_listed)
+    (presence, allow_instant_consult)
+    specialty_id
+    seniority_level
+    push_token
+  }
+
+  // FR-4.4 filters listings by language. `languages` is jsonb, so it needs a
+  // GIN index that DBML cannot express - added by hand in migration.
+
+  Note: 'No reliability counters and no active_consultation_id - both are counted from consultations and instant_consultancy when needed. Only the completion gate is cached, because it is checked on every instant routing decision. No verification_note: a rejection is per document (doctor_documents.rejection_reason), which is what the doctor must act on; the admin note on the doctor decision itself is the metadata of the audit_log row where action = verify. No last_heartbeat_at: presence is carried on the realtime channel (M-13), so the socket already knows who is live - its disconnect handler, and a sweep at boot, write presence = offline. A heartbeat column is a row write per online doctor every few seconds for a fact the channel holds already. No email (nothing sends one, and sign-in is by mobile), no gender and no registration_council (no listing, filter or profile in the SRS shows them), no created_by (that is the audit_log row where action = create).'
+}
+
+Table doctor_documents {
+  id uuid [pk, default: `gen_random_uuid()`]
+  doctor_id uuid [not null]
+  document_type doctor_document_type [not null]
+
+  storage_key text [not null, unique, note: 'object-store key, never exposed to the client']
+  file_name varchar(255) [not null]
+
+  review_status document_review_status [not null, default: 'pending']
+  verified_by_admin_id uuid [note: 'the admin who checked THIS document']
+  verified_at timestamptz
+  rejection_reason varchar(255)
+
+  created_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (doctor_id, document_type)
+    (review_status, created_at)
+  }
+
+  Note: 'Separate from patient_files on purpose - these are the doctor own credentials, read only by admins and that doctor. No size_bytes and no mime_type: the object store is authoritative for both - it serves the Content-Type it was uploaded with, and the preview icon comes off the file_name extension. No expires_on: renewal chasing needs a roster with certificates already expiring, and verifying registrations is the client obligation under SRS section 8, not work this release does.'
+}
+
+Enum doctor_document_type {
+  degree_certificate
+  registration_certificate
+  identity_proof
+  address_proof
+  experience_letter
+  profile_photo
+  signature
+  other
+}
+
+Enum document_review_status {
+  pending
+  approved
+  rejected
+}
+
+// ############################################################################
+// 4. CATALOGUE
+// ############################################################################
+
+Table specialties {
+  id uuid [pk, default: `gen_random_uuid()`]
+  code varchar(60) [not null, unique, note: 'psychiatry, psychology, therapy, counselling, de_addiction']
+  name varchar(120) [not null]
+  description text
+  provider_type provider_type [not null, default: 'non_doctor', note: '*** WHICH REGISTRATION FORM *** a provider of this specialty is created on, and therefore whether a medical council registration number is required - SRS FR-19.7']
+  can_prescribe boolean [not null, default: false, note: 'THE prescribing gate. psychiatry true, the rest false. Correlated with provider_type at launch but kept separate: prescribing is a clinical permission, provider_type is a professional category.']
+  consultation_fee_inr numeric(10,2) [not null, default: 0, note: '*** WHAT THE PATIENT IS CHARGED *** quoted before a provider is assigned - SRS FR-7.8']
+  intake_form jsonb [note: 'ordered field list - key, label, input type, options, required']
+  first_consult_form jsonb [note: 'the medical-history block, asked only on a first consultation']
+  required_documents jsonb [not null, default: `'[]'`, note: 'doctor_document_type values a doctor of this specialty must submit']
+  is_active boolean [not null, default: true]
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Note: 'Adding a row here is how a new specialty goes live, on either registration form. No code change, no app release. No default_duration_min - the bookable length is doctors.consultation_duration_min, and a seed value for an admin form field is not data. No icon_key - the app maps code to an icon it ships, and a specialty added after release shows the default one until the next build. No sort_order - the five launch specialties list by name, and a hand-ordered shelf is not something any screen asks for.'
+}
+
+// Which of the two registration forms a specialty uses (SRS FR-19.7). Held on
+// the SPECIALTY, never on the provider: the specialty already decides the
+// required credential list and prescribing, and a copy on the provider row
+// could disagree with it.
+Enum provider_type {
+  doctor           [note: 'medically qualified, holds a council registration number, may prescribe where the specialty allows']
+  non_doctor       [note: 'psychologist, therapist, counsellor. Advice and a therapy plan, never a prescription.']
+}
+
+Table regions {
+  id uuid [pk, default: `gen_random_uuid()`]
+  code varchar(60) [not null, unique, note: 'karnataka, maharashtra, delhi - a state or province, SRS FR-20.11']
+  name varchar(120) [not null]
+  is_active boolean [not null, default: true]
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Note: 'Rows, not an enum, so the client adds a region from the panel with no release (SRS FR-19.8) - and so the granularity can change from states to something else later without a migration. No sort_order: regions list by name. No parent_region_id: nothing in this release asks for a hierarchy, and a self-referencing tree nobody queries is a cost with no reader.'
+}
+
+// *** THE REGION POOL ***  An admin puts a provider into the regions they
+// serve. Many-to-many because a provider serves several states, and each
+// membership is a row an admin adds or removes on its own.
+//
+// Languages need no equivalent table: what a provider speaks is already
+// `doctors.languages`, and what a patient prefers is already on their row.
+Table doctor_regions {
+  doctor_id uuid [not null]
+  region_id uuid [not null]
+  created_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (doctor_id, region_id) [pk]
+    region_id
+  }
+
+  Note: 'Owned by M-05, because which regions a provider serves is an attribute of that provider - exactly as doctors.specialty_id is, while the catalogue it points at belongs to M-06. No is_active: a pool a provider has left is a row deleted, not a row flagged. No assigned_by_admin_id: who put them in the pool, and when, is the audit_log row.'
+}
+
+Table concerns {
+  id uuid [pk, default: `gen_random_uuid()`]
+  specialty_id uuid [not null]
+  code varchar(60) [not null, note: 'depression, anxiety, sleep, ocd, substance_use, psychosis, child_adolescent, womens_mental_health, elderly_care']
+  name varchar(120) [not null, note: 'also the plain-language match reason FR-5.4 shows - "matched to: sleep, anxiety"']
+  match_phrases jsonb [not null, default: `'[]'`, note: 'trigger phrases and synonyms - English, Hindi and mixed']
+  match_weight smallint [not null, default: 1]
+  is_active boolean [not null, default: true]
+
+  indexes {
+    (specialty_id, code) [unique]
+  }
+
+  Note: 'No sort_order - a concern list is ordered by name, and search results are ordered by match_weight against the query, never by a hand-set position.'
+}
+
+// ############################################################################
+// 5. AVAILABILITY
+//    Bookable slots are COMPUTED from this minus existing consultations.
+// ############################################################################
+
+Enum availability_rule_type {
+  weekly
+  blocked
+  custom_hours
+}
+
+Table doctor_availability {
+  id uuid [pk, default: `gen_random_uuid()`]
+  doctor_id uuid [not null]
+  rule_type availability_rule_type [not null]
+  day_of_week smallint [note: 'required when rule_type = weekly. 0 Sunday through 6 Saturday']
+  specific_date date [note: 'required when rule_type = blocked or custom_hours']
+  start_time time
+  end_time time
+  channels consultation_channel[] [not null, default: `'{video,audio}'`, note: 'which remote channels this slot is offered on. Defaults to both so an existing rule keeps working unchanged.']
+  created_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (doctor_id, rule_type)
+    (doctor_id, specific_date)
+  }
+
+  Note: 'A rule that no longer applies is deleted, not deactivated - there is no is_active, and no free-text reason that no screen reads.'
+}
+
+// ############################################################################
+// 6. CONSULTATIONS  ***  THE SPINE  ***
+//    Absorbs the slot hold, the video session, the follow-up plan and the
+//    patient feedback. NOTE what is NOT here:
+//      no scheduled_end_at         = scheduled_start_at + duration_minutes
+//      no video_duration           = summed from consultation_participants
+//      no started_at               = min(consultation_participants.joined_at)
+//      no ended_at                 = max(consultation_participants.left_at)
+//      no livekit_room_name        = a pure function of this row id
+//      no livekit_server_url       = one deployment, one LIVEKIT_URL in env
+//      no clinically_completed_at  = clinical_records.finalised_at
+//      no is_first_consultation    = no earlier consultation for this patient
+//      no no_show_party            = the party with no participant row
+//      no followup_ends_on         = followup_starts_on + pathway duration_days
+// ############################################################################
+
+Enum consultation_mode {
+  scheduled
+  instant
+}
+
+// Remote channel only - SRS 11 excludes in-person and provider travel from
+// this release; every consultation is remote.
+Enum consultation_channel {
+  video
+  audio
+}
+
+Enum consultation_status {
+  pending_payment
+  scheduled
+  awaiting_doctor
+  in_progress
+  awaiting_documentation
+  completed
+  cancelled
+  no_show
+  expired
+}
+
+Enum party {
+  patient
+  doctor
+  admin
+  system
+}
+
+Enum followup_status {
+  none
+  active
+  completed
+  cancelled
+}
+
+Table consultations {
+  id uuid [pk, default: `gen_random_uuid()`, note: '*** THE CONSULTATION ID ***']
+  reference_code varchar(24) [not null, unique]
+
+  patient_id uuid [not null]
+  doctor_id uuid [note: 'NULL only while an instant request is still searching for a doctor']
+  specialty_id uuid [not null, note: 'BOOKING-TIME SNAPSHOT. Not derivable: concern_id and doctor_id are both nullable, and instant routing needs a specialty BEFORE any doctor is chosen.']
+  concern_id uuid
+
+  mode consultation_mode [not null]
+  channel consultation_channel [not null, default: 'video', note: 'video or audio call, chosen at booking against the slot doctor_availability offered']
+  status consultation_status [not null, default: 'pending_payment']
+
+  scheduled_start_at timestamptz
+  duration_minutes smallint [not null]
+  hold_expires_at timestamptz [note: 'while status = pending_payment this row IS the slot hold; a sweep expires it']
+
+  intake_answers jsonb [note: 'snapshot of answers to the specialty intake form, including whatever free-text field that form carries. There is no separate patient_note.']
+
+  rescheduled_from_consultation_id uuid [note: 'self-reference - the prior consultation this replaced']
+  cancelled_at timestamptz
+  cancelled_by_party party
+  cancellation_reason varchar(200)
+
+  // FR-8.6 session metadata is NOT here. The LiveKit room is named from this
+  // row id, so it is computed, never stored - one room per consultation by
+  // construction - and every join and leave is a consultation_participants
+  // row, because a dropped mobile network makes each party join more than
+  // once and four timestamps can only hold the first.
+
+  followup_pathway_id uuid [note: 'pinned to the pathway version in force when assigned']
+  followup_starts_on date
+  followup_status followup_status [not null, default: 'none', note: 'cancelled is the state no date arithmetic can produce, which is why this stays']
+  extra_checkin_questions jsonb [not null, default: `'[]'`, note: 'FR-13.8 - DOCTOR-added daily check-in questions for THIS patient only, on top of the pathway set. Carry NO red-flag rules, so safety alerting stays on the clinician-approved set.']
+
+  feedback_rating smallint [note: '1 to 5. Set = feedback submitted, so there is no feedback_at.']
+  feedback_comment text
+
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (patient_id, status)
+    (doctor_id, status)
+    (doctor_id, scheduled_start_at)
+    (status, scheduled_start_at)
+    (followup_status, followup_starts_on)
+    hold_expires_at
+  }
+
+  Note: 'NO video or audio is recorded. Join and leave times live in consultation_participants, one row per LiveKit connection, so status = no_show plus the absence of a row for that party is what names the no-show. The follow-up window ends at followup_starts_on plus the pinned pathway duration_days, so the daily check-in job reads the pathway rather than a second copy of the date. Double-booking, and the partial index behind the pending-documentation worklist, are added by hand in the first migration - see db/README.md.'
+}
+
+// ---------------------------------------------------------------------------
+// THE LIVEKIT SESSION RECORD - FR-8.6, written only by the LiveKit webhook.
+//
+// The room is NOT a row. It is named from consultations.id, so one room per
+// consultation is true by construction and there is nothing to keep in step.
+// The join token is NOT a row either - it lives for minutes, and its issue is
+// the audit_log row where action = create and entity_type = livekit_token.
+//
+// What IS a row is a single WebRTC connection. LiveKit fires
+// participant_joined and participant_left per connection, and a phone that
+// loses signal mid-consult produces several of each; four timestamps on the
+// consultation could only ever hold the first. The participant sid is the
+// primary key because LiveKit generates it per connection and never reuses
+// it, which makes a retried or duplicated webhook a no-op instead of a
+// corrupted duration.
+// ---------------------------------------------------------------------------
+
+Table consultation_participants {
+  livekit_participant_sid varchar(64) [pk, note: 'LiveKit PA_xxx, unique per CONNECTION - this being the key is what makes webhook redelivery idempotent']
+  consultation_id uuid [not null, note: 'parsed from the room name, which is a function of this id']
+
+  // patient or doctor only - nobody else is ever issued a join token.
+  // Which patient and which doctor is on the consultation row, so this names
+  // the person without repeating either foreign key.
+  party party [not null]
+
+  joined_at timestamptz [not null, note: 'participant_joined webhook']
+  left_at timestamptz [note: 'participant_left webhook. Null = still connected, or the webhook never arrived']
+  disconnect_reason varchar(40) [note: "LiveKit DisconnectReason verbatim (CLIENT_INITIATED, DUPLICATE_IDENTITY, ROOM_DELETED...). Not an enum: LiveKit owns this vocabulary and adds to it. Read when adjudicating a technical_issue complaint or a refund - it is the only thing separating a hang-up from a dropped network."]
+
+  indexes {
+    (consultation_id, party, joined_at)
+  }
+
+  Note: 'One row per LiveKit connection, so a reconnect adds a row rather than overwriting one. Call duration is the summed intervals, first join is min(joined_at), and the party with NO row here is the one that did not show - none of the three is stored. Only party = patient and party = doctor are ever written; the CHECK is added by hand in the first migration - see db/README.md.'
+}
+
+
+Table instant_consultancy {
+  id uuid [pk, default: `gen_random_uuid()`]
+  consultation_id uuid [not null]
+  doctor_id uuid [not null]
+  attempt_number smallint [not null, note: 'routing order - 1 is the first doctor tried']
+  outcome instant_consultancy_outcome [not null, default: 'pending']
+  offered_at timestamptz [not null, default: `now()`]
+  expires_at timestamptz [not null, note: 'acceptance window, configured in app_config']
+
+  indexes {
+    (consultation_id, attempt_number) [unique]
+    (doctor_id, outcome)
+    expires_at
+  }
+
+  Note: 'One row per doctor offered. Also the source for the FR-18.6 acceptance-rate metric, so no counter is cached on doctors. No responded_at - the acceptance rate counts outcomes, and response latency is not a reported figure.'
+}
+
+Enum instant_consultancy_outcome {
+  pending
+  accepted
+  declined
+  timed_out
+  superseded
+}
+
+// ############################################################################
+// 7. PAYMENTS
+//    ONE row per consultation. Absorbs the refund and the payout.
+//    patient_id and doctor_id are NOT repeated here - this row is 1:1 with a
+//    consultation, which already holds both. One home per fact.
+//
+//    Stored: the inputs and the two rounded figures that must be exact.
+//    Derived, so NOT stored:
+//      subtotal      = consultation_fee + convenience_fee
+//      total_payable = consultation_fee + convenience_fee + gst_amount
+//      payout_amount = consultation_fee  (platform deduction is always zero)
+//      payout_status = payout_paid_at IS NULL ? pending : paid
+//
+//    Example: fee 500 + convenience 20% (100) -> subtotal 600, GST 18% (108),
+//    charged 708. Doctor gets 500. That is FR-7.3 exactly.
+// ############################################################################
+
+Enum payment_status {
+  created
+  pending
+  paid
+  failed
+  refunded
+}
+
+Table payments {
+  id uuid [pk, default: `gen_random_uuid()`]
+  consultation_id uuid [not null, unique]
+
+  consultation_fee numeric(10,2) [not null, note: 'frozen at checkout - the doctor keeps all of it']
+  convenience_fee_pct numeric(5,2) [not null, note: 'the rate in force at checkout. FR-7.3 prints the percentage on the bill, and app_config may have moved on since.']
+  convenience_fee numeric(10,2) [not null, note: 'stored because rounding must not be recomputed']
+  gst_pct numeric(5,2) [not null, note: 'same reason as convenience_fee_pct - the bill shows GST at 18 percent']
+  gst_amount numeric(10,2) [not null, note: 'stored for the same rounding reason']
+
+  status payment_status [not null, default: 'created']
+  gateway_order_id varchar(120) [unique]
+  gateway_payment_id varchar(120) [unique, note: 'IDEMPOTENCY - a replayed capture webhook finds this set and no-ops']
+  payment_method varchar(40) [note: 'upi, card, netbanking, wallet - FR-7.1, shown in payment history']
+  paid_at timestamptz
+  failure_reason varchar(200)
+
+  refund_amount numeric(10,2) [not null, default: 0]
+  refund_reason varchar(200)
+  refund_initiated_by_admin_id uuid [note: 'refunds are raised from the panel only, FR-7.7']
+  gateway_refund_id varchar(120) [unique, note: 'IDEMPOTENCY - stops a replayed refund webhook double-refunding']
+  refunded_at timestamptz
+
+  payout_paid_at timestamptz [note: 'NULL until the transfer is made - this IS the payout status. Payouts are manual this release.']
+
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (status, created_at)
+    paid_at
+  }
+
+  Note: 'Becomes paid ONLY on a webhook whose HMAC signature verifies, never on a client result. There is no gateway column: Razorpay is the only one this release integrates, and a constant is not data. No payout_reference: FR-9.9 shows the doctor an amount and a status, and FR-18.4 exports transactions and refunds - no screen prints a bank transfer reference, so the admin who marks a payout paid puts the reference in the metadata of that audit_log row. Only the rounded parts are stored - the figure sent to the gateway is their sum. The unpaid-payout queue reads a partial index added by hand, see db/README.md.'
+}
+
+// ############################################################################
+// 8. CLINICAL RECORD
+//    ONE row per consultation. Medicine lines are a jsonb array, not a table.
+//    Kept out of `consultations` because it FREEZES on finalise, while the
+//    consultation row keeps changing. patient_id and doctor_id are NOT
+//    repeated - read them through the consultation.
+//
+//    `finalised_at` alone carries the draft/finalised state, and the generated
+//    PDF is found through patient_files, so neither is a column here.
+// ############################################################################
+
+Enum risk_category {
+  low
+  moderate
+  high
+}
+
+Table clinical_records {
+  id uuid [pk, default: `gen_random_uuid()`]
+  consultation_id uuid [not null, unique]
+
+  chief_complaint text [not null]
+  clinical_history text
+  diagnosis text [note: 'diagnosis or provisional diagnosis']
+  is_diagnosis_provisional boolean [not null, default: true]
+  risk_category risk_category [not null]
+  referral_note varchar(255) [note: 'set = a referral was advised, and this is it. No separate referral_advised flag.']
+
+  // MUST stay empty unless the doctor specialty has can_prescribe = true
+  medicines jsonb [not null, default: `'[]'`, note: 'array of - id, name, dose, frequency, duration, instructions, generic_name, route, quantity. id is a client-tracking uuid assigned on save, not a row key - this stays a jsonb array, not a table.']
+
+  // Advice and therapy plan - written by EVERY professional, prescribing or not
+  advice_covered text [note: 'what was covered this session']
+  advice_home_practice text
+  advice_next_focus text
+  advice_warning_signs text [note: 'surfaced on the patient Care Plan, FR-14.1']
+
+  case_summary text [note: '3 to 5 lines - required before finalising']
+  recommended_content_ids jsonb [not null, default: `'[]'`, note: 'Care Hub items the doctor picked, FR-15.4']
+
+  finalised_at timestamptz [note: '*** THE COMPLETION GATE ***  NULL = still a draft. The PDF is the patient_files row with this consultation_id and file_category = prescription_pdf.']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    finalised_at
+  }
+
+  Note: '''
+    THE COMPLETION GATE. Setting `finalised_at` requires case_summary, plus
+    either a medicine line (prescribing specialty) or the advice fields
+    (non-prescribing). The same transaction clears
+    doctors.blocked_by_consultation_id. There is no second copy of this
+    timestamp on the consultation row - it is read through here.
+
+    There is no has_clinical_doubt flag. A doubt IS a clarification_cases row
+    with this source_consultation_id; the flag was a second way of saying the
+    same thing and could disagree with it.
+
+    The doctor pending-summaries worklist is `finalised_at IS NULL`, joined
+    through consultations on doctor_id. It reads a partial index added by
+    hand - see db/README.md.
+  '''
+}
+
+// ############################################################################
+// 9. PATIENT FILES
+//     Renamed from `documents` so it cannot be confused with content_items,
+//     legal_documents or doctor_documents. These are PATIENT clinical files.
+// ############################################################################
+
+Enum patient_file_category {
+  medical_history
+  report
+  photo
+  prescription_pdf
+  clarification_attachment
+}
+
+Enum report_request_status {
+  open
+  fulfilled
+  cancelled
+}
+
+Enum report_request_category {
+  prescription
+  lab
+  history
+  other
+}
+
+Table patient_files {
+  id uuid [pk, default: `gen_random_uuid()`]
+  file_category patient_file_category [not null]
+  patient_id uuid [note: 'set for every clinical file, so history predating any booking is still readable']
+
+  // Who uploaded it. A patient can only ever upload their OWN file, so that
+  // case needs no column of its own: uploaded_by_doctor_id IS NULL means the
+  // uploader is patient_id. CHECK in migration:
+  //   CHECK (uploaded_by_doctor_id IS NOT NULL OR patient_id IS NOT NULL)
+  uploaded_by_doctor_id uuid [note: 'set when a doctor uploaded on the patient behalf; NULL means the patient uploaded it themselves']
+
+  consultation_id uuid [note: 'null when the file belongs to the patient rather than one booking']
+  report_request_id uuid [note: 'set when uploaded against a doctor request, so it arrives labelled - and so the request is fulfilled without a second timestamp']
+  clarification_case_id uuid [note: 'set for a de-identified attachment. When set, patient_id MUST be null - enforced by CHECK, see below.']
+
+  storage_key text [not null, unique, note: 'object-store key, never exposed to the client']
+  file_name varchar(255) [not null]
+
+  deleted_at timestamptz [note: 'soft delete. Set = deleted; there is no separate is_deleted flag.']
+  created_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (patient_id, file_category)
+    consultation_id
+    report_request_id
+    clarification_case_id
+  }
+
+  Note: '''
+    Served only through short-lived signed URLs minted after an ownership check.
+    No size_bytes and no mime_type: the object store is authoritative for both.
+    It serves the Content-Type the file was uploaded with, and the preview icon
+    comes off the file_name extension.
+
+    DE-IDENTIFICATION IS STRUCTURAL, not a coding convention. A file attached to
+    a clarification case is stored as a scrubbed copy with patient_id NULL, so
+    an expert-facing query cannot reach a patient through it even by mistake:
+
+      CHECK (clarification_case_id IS NULL OR patient_id IS NULL)
+  '''
+}
+
+Table report_requests {
+  id uuid [pk, default: `gen_random_uuid()`]
+  consultation_id uuid [not null]
+  title varchar(160) [not null, note: 'what is needed']
+  category report_request_category [not null, default: 'other', note: 'coarse bucket the app filters/groups by. title stays free text for the actual ask.']
+  reason text [note: 'why - shown to the patient']
+  status report_request_status [not null, default: 'open']
+  created_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (consultation_id, status)
+    (status, created_at)
+  }
+
+  Note: 'Patient and doctor are read through the consultation. The treating doctor is always consultations.doctor_id. No fulfilled_at - the arriving patient_files row carries that time in its created_at. No due_by either: no requirement sets a deadline or chases one.'
+}
+
+// ############################################################################
+// 10. FOLLOW-UP AND SAFETY
+// ############################################################################
+
+Enum checkin_status {
+  green
+  amber
+  red
+}
+
+Enum safety_alert_type {
+  red_flag
+  amber
+  missed_checkin
+  medication_side_effect
+  followup_due
+}
+
+Table followup_pathways {
+  id uuid [pk, default: `gen_random_uuid()`]
+  code varchar(60) [not null, note: 'depression_anxiety, sleep, substance_use, bipolar_psychosis, general']
+  name varchar(120) [not null]
+  version smallint [not null, default: 1]
+  duration_days smallint [not null, default: 7, note: 'the follow-up window length. consultations.followup_starts_on plus this IS the end date.']
+  questions jsonb [not null, note: 'ordered question set with the flag rule per option']
+  red_flag_rules jsonb [not null, note: 'conditions forcing a red status, FR-13.5']
+  is_current boolean [not null, default: false]
+  created_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (code, version) [unique]
+    (code, is_current)
+  }
+
+  Note: 'Admin-editable with no app release, FR-13.7. Versioned whole, so an in-flight assignment keeps the version it started on. No published_at - is_current is what decides which version new assignments get, and when it went live is the audit_log row.'
+}
+
+Table checkin_responses {
+  id uuid [pk, default: `gen_random_uuid()`]
+  consultation_id uuid [not null]
+  checkin_date date [not null]
+  answers jsonb [not null, note: 'keyed to the pinned pathway question set']
+  status checkin_status [not null]
+  submitted_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (consultation_id, checkin_date) [unique]
+    (status, submitted_at)
+  }
+
+  Note: 'One row per patient per day. A MISSING row past its date raises a missed_checkin alert. No triggered_rules - answers plus the pinned pathway version reproduce exactly which rules fired, and the alert raised carries the human-readable reason.'
+}
+
+Table safety_alerts {
+  id uuid [pk, default: `gen_random_uuid()`]
+  alert_type safety_alert_type [not null]
+  consultation_id uuid [not null]
+  checkin_response_id uuid
+  reason varchar(255) [note: 'why it fired, in plain words. NEVER names a diagnosis.']
+
+  // Either an admin or the treating doctor may acknowledge. CHECK in migration:
+  //   CHECK (num_nonnulls(acknowledged_by_admin_id, acknowledged_by_doctor_id) <= 1)
+  acknowledged_by_admin_id uuid
+  acknowledged_by_doctor_id uuid
+  acknowledged_at timestamptz [note: 'NULL and closed_at NULL = open']
+  closed_at timestamptz [note: 'set = closed. These two timestamps ARE the status.']
+  closing_note text
+  created_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (alert_type, created_at)
+    consultation_id
+  }
+
+  Note: 'A red status alerts BOTH the treating doctor and admins at care_coordinator or clinical_governance level. There is no status column: open, acknowledged and closed are read from acknowledged_at and closed_at, and the open-alerts queue is a partial index added by hand - see db/README.md.'
+}
+
+// ############################################################################
+// 11. CASE CLARIFICATION
+// ############################################################################
+
+Enum clarification_status {
+  draft
+  posted
+  awaiting_response
+  response_received
+  clarification_asked
+  reviewed
+  closed
+}
+
+Enum clarification_urgency {
+  routine
+  soon
+  urgent
+}
+
+Table clarification_cases {
+  id uuid [pk, default: `gen_random_uuid()`]
+  treating_doctor_id uuid [not null]
+  source_consultation_id uuid [note: 'for the treating doctor and audit ONLY - never exposed to the reviewer']
+
+  // De-identified snapshot. Name, phone, address and email are NEVER written here.
+  title varchar(200) [not null]
+  topic varchar(120) [note: 'free-text guidance area, e.g. "drug interaction". Not an FR-12.3 field - scanned by the same de-identification pass as title/brief_history.']
+  patient_age smallint
+  patient_gender gender
+  brief_history text [not null]
+  diagnosis text
+  current_plan text
+  specific_doubt text [not null]
+  urgency clarification_urgency [not null, default: 'routine']
+
+  expert_doctor_id uuid [note: 'must be a doctor with seniority_level = expert']
+  assigned_at timestamptz [note: 'drives the urgency queue. Which admin assigned it is the audit_log row.']
+
+  messages jsonb [not null, default: `'[]'`, note: 'array of - author_id, author_type, message_type, body, at']
+
+  status clarification_status [not null, default: 'draft']
+  posted_at timestamptz
+  closed_at timestamptz
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (treating_doctor_id, status)
+    (expert_doctor_id, status)
+    (status, urgency)
+  }
+
+  Note: 'TWO independent checks. seniority_level = expert says WHO MAY BE ASKED. expert_doctor_id says WHAT THEY MAY SEE. Nothing here reaches the patient automatically. No viewed_at and no responded_at - the status enum already carries awaiting_response and response_received, and the expert reply is a messages entry carrying its own `at`.'
+}
+
+// ############################################################################
+// 12. CARE HUB
+//     ONE content table for every published item, separated by `item_type`.
+//     Doctor recommendations live on clinical_records.
+// ############################################################################
+
+Enum content_item_type {
+  self_help_tool
+  education_module
+  blog_article
+  caregiver_guide
+  emergency_guidance
+  support_org
+  clinical_reference
+}
+
+Enum content_review_status {
+  draft
+  in_clinical_review
+  published
+  archived
+}
+
+Table content_items {
+  id uuid [pk, default: `gen_random_uuid()`]
+  item_type content_item_type [not null]
+  slug varchar(160) [not null, unique]
+  title varchar(200) [not null]
+  summary varchar(400)
+  body jsonb [not null, note: 'structured blocks. For item_type = support_org this holds phone, address, timings.']
+  concern_id uuid
+  specialty_id uuid [note: 'used by item_type = clinical_reference']
+  cover_storage_key text [note: 'admin-uploaded cover image. Held as a storage key, NOT a patient_files row - content media is public and has no patient owner, so it must not go through the patient-ownership guard.']
+  is_verified_org boolean [note: 'item_type = support_org only - has this helpline or NGO been checked. FR-15.6 requires it shown and filtered, so it is a column rather than a key inside body.']
+  review_status content_review_status [not null, default: 'draft']
+  reviewed_by_admin_id uuid [note: 'the clinical reviewer is the client, not the developer']
+  reviewed_at timestamptz
+  sort_order smallint [not null, default: 0]
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (item_type, review_status)
+    (concern_id, item_type)
+  }
+
+  Note: 'No locale - a multilingual app is Phase 3 in SRS section 11, so every row is in the launch language. No published_at - review_status = published says it, and sort_order plus created_at order the shelf. No cover_mime_type - the cover is one admin-uploaded image and the object store types it.'
+}
+
+// ############################################################################
+// 13. COMPLAINTS
+//     Patient feedback lives on consultations. This is the complaint workflow.
+// ############################################################################
+
+Enum complaint_status {
+  open
+  in_progress
+  resolved
+  rejected
+}
+
+Enum complaint_category {
+  consultation_quality
+  doctor_conduct
+  technical_issue
+  payment_issue
+  other
+}
+
+Table complaints {
+  id uuid [pk, default: `gen_random_uuid()`]
+  reference_code varchar(24) [not null, unique, note: 'the ticket number the patient quotes to support']
+  patient_id uuid [not null]
+  consultation_id uuid [note: 'null when not about one consultation']
+  category complaint_category [not null]
+  subject varchar(200) [not null]
+  description text [not null]
+  status complaint_status [not null, default: 'open']
+  assigned_to_admin_id uuid
+  messages jsonb [not null, default: `'[]'`, note: 'array of - author_id, author_type, body, is_internal, at']
+  resolved_at timestamptz
+  resolution_note text
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (status, created_at)
+    patient_id
+  }
+
+  Note: 'FR-18.8 tracks resolution, so resolved_at stays beside a four-state status - rejected is not resolved, and neither is derivable from the other.'
+}
+
+// ############################################################################
+// 14. CONSENT AND LEGAL
+//     legal_documents = the text, ~6 rows ever, never edited in place.
+//     consents        = one signature per person per document version.
+//     `version` is NOT repeated on consents - legal_document_id already pins
+//     the exact version that was accepted.
+// ############################################################################
+
+Enum legal_document_type {
+  teleconsultation_consent
+  privacy_policy
+  terms_of_use
+  refund_policy
+  reconsult_policy
+  doctor_agreement
+}
+
+Enum deletion_status {
+  requested
+  in_review
+  approved
+  rejected
+  executed
+  failed
+}
+
+Table legal_documents {
+  id uuid [pk, default: `gen_random_uuid()`]
+  document_type legal_document_type [not null]
+  version varchar(20) [not null, note: 'client-set. A new version is a NEW ROW - never edit one people have accepted.']
+  title varchar(200) [not null]
+  body text [not null, note: 'client-supplied copy']
+  is_current boolean [not null, default: false, note: 'the version new users must accept']
+  created_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (document_type, version) [unique]
+    (document_type, is_current)
+  }
+
+  Note: 'No locale - single-language at launch, same as content_items. No published_at - is_current decides what is served, and created_at records when the row was written.'
+}
+
+Table consents {
+  id uuid [pk, default: `gen_random_uuid()`]
+
+  // Exactly ONE is set. CHECK in migration:
+  //   CHECK (num_nonnulls(patient_id, doctor_id) = 1)
+  patient_id uuid
+  doctor_id uuid
+
+  legal_document_id uuid [not null, note: 'pins the exact version accepted']
+  document_type legal_document_type [not null, note: 'denormalised so the pre-consult check needs no join. A COMPOSITE FK to legal_documents (id, document_type) makes it impossible for this to disagree - see db/README.md.']
+  accepted_at timestamptz [not null, default: `now()`]
+  ip_address inet [note: 'kept here and nowhere else on an account - this is the legal evidence of acceptance']
+
+  indexes {
+    (patient_id, legal_document_id) [unique]
+    (doctor_id, legal_document_id) [unique]
+    (patient_id, document_type)
+  }
+
+  Note: 'No consultation may start without a current teleconsultation consent. Append-only legal evidence.'
+}
+
+Table data_deletion_requests {
+  id uuid [pk, default: `gen_random_uuid()`]
+  patient_id uuid [not null]
+  status deletion_status [not null, default: 'requested']
+  reason text
+  reviewed_by_admin_id uuid
+  reviewed_at timestamptz
+  review_note text
+  execution_outcome jsonb [note: 'one record of what happened - per-table counts deleted or anonymised, what was lawfully retained with the ground for retaining it, or why the run failed. Written once, at execution.']
+  executed_at timestamptz
+  created_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (status, created_at)
+    patient_id
+  }
+
+  Note: 'Required by App Store guideline 5.1.1(v) and the DPDP Act. The evidence outlives the data it describes. Deleted and retained were two columns written in the same transaction and always read together, so they are one - and a failed run writes its reason into that same execution_outcome record, so there is no separate failure_reason.'
+}
+
+// ############################################################################
+// 15. NOTIFICATIONS
+//     Templates live in app_config as JSON. Push tokens live on account rows.
+//     No app_client column - the recipient column already implies the app.
+// ############################################################################
+
+Enum notification_status {
+  queued
+  sent
+  failed
+}
+
+Table notifications {
+  id bigserial [pk]
+
+  // Exactly ONE recipient. CHECK in migration:
+  //   CHECK (num_nonnulls(patient_id, doctor_id, admin_id) = 1)
+  patient_id uuid
+  doctor_id uuid
+  admin_id uuid [note: 'read in the panel - admins have no push token']
+
+  template_code varchar(80) [not null, note: 'booking_confirmed, consult_reminder, doctor_joined, prescription_ready, checkin_due, report_requested, instant_request, red_flag_alert, amber_alert, missed_checkin, pending_documentation, report_uploaded, document_rejected, doctor_approved. A varchar, not an enum - the copy behind each code is an app_config value the admin edits, so adding a code must not need a migration.']
+  title varchar(200) [not null]
+  body text [not null, note: 'the copy AS SENT. Kept because the template may change later. MUST NOT name a diagnosis, FR-16.2.']
+  deep_link_data jsonb [note: 'deep-link payload']
+  consultation_id uuid
+  status notification_status [not null, default: 'queued', note: 'delivery only. Whether it was READ is read_at.']
+  sent_at timestamptz
+  read_at timestamptz [note: 'set = read. There is no read value in the status enum saying the same thing.']
+  failure_reason varchar(200)
+  created_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (patient_id, created_at)
+    (doctor_id, created_at)
+    (admin_id, created_at)
+    (status, created_at)
+  }
+}
+
+// ############################################################################
+// 16. PLATFORM
+//     Config-as-data and the audit trail every module writes to.
+//     The admin governance dashboard owns NO tables - every queue and metric
+//     is read from the table that owns it.
+// ############################################################################
+
+Enum audit_action {
+  create
+  read
+  update
+  delete
+  export
+  login
+  verify
+  webhook
+}
+
+Enum actor_type {
+  patient
+  doctor
+  admin
+  system
+}
+
+Table app_config {
+  id uuid [pk, default: `gen_random_uuid()`]
+  key varchar(160) [not null, unique]
+  value jsonb [not null]
+  description text
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  Note: '''
+    Everything the admin can change without a release, as JSON values:
+      payments.convenience_fee_pct     payments.gst_pct
+      booking.slot_hold_minutes        instant.acceptance_window_seconds
+      booking.cancellation_policy      booking.reschedule_policy
+      search.crisis_keywords           search.popular_searches
+      notifications.templates          retention.policies
+      video.join_token_ttl_seconds     video.join_window_minutes
+
+    `video.join_window_minutes` is how early before scheduled_start_at the
+    backend will mint a join token, and `video.join_token_ttl_seconds` is how
+    long that token stays good. Both are business rules an admin tunes, so
+    neither is a constant in code. The LiveKit server URL is NOT here - it is
+    `LIVEKIT_URL` in the environment, one per deployment, and the API key and
+    secret are environment secrets.
+
+    Every change is an audit_log row carrying the actor and the before/after
+    value, so a config change is reversible without a versions table and
+    without an updated_by_admin_id that repeats what the log already holds.
+    Secrets are NEVER stored here.
+  '''
+}
+
+Table audit_log {
+  id bigserial [pk]
+
+  // No foreign key on purpose. An entry must survive the deletion of whatever
+  // it describes, and the actor may be any of the three account kinds.
+  actor_type actor_type [not null]
+  actor_id uuid [note: 'null for system']
+
+  action audit_action [not null]
+  entity_type varchar(80) [not null]
+  entity_id varchar(80) [not null]
+  consultation_id uuid
+  metadata jsonb [note: 'before/after for config, raw payload for webhooks, identifier for login attempts, document id for verification']
+  ip_address inet
+  created_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (actor_type, actor_id, created_at)
+    (entity_type, entity_id)
+    (action, created_at)
+    consultation_id
+  }
+
+  Note: 'Append-only. Absorbs the login-attempt log (action = login), which is what rate limiting reads, and the credential sign-off trail (action = verify). No summary column - the viewer composes a line from actor_type, action and entity_type, and anything more specific is already in metadata.'
+}
+
+// ############################################################################
+// ############################################################################
+// RELATIONSHIPS - every connection in the database, in one place.
+//   >  many-to-one      -  one-to-one
+//
+// audit_log has NO foreign key: its actor may be any account kind, and an
+// entry must outlive whatever it describes.
+// ############################################################################
+// ############################################################################
+
+// -- Doctors -----------------------------------------------------------------
+Ref: doctors.verified_by_admin_id > admins.id
+Ref: doctors.specialty_id > specialties.id
+Ref: doctors.blocked_by_consultation_id > consultations.id
+Ref: doctor_documents.doctor_id > doctors.id
+Ref: doctor_documents.verified_by_admin_id > admins.id
+Ref: doctor_availability.doctor_id > doctors.id
+Ref: doctor_regions.doctor_id > doctors.id
+Ref: doctor_regions.region_id > regions.id
+Ref: patients.region_id > regions.id
+
+// -- Catalogue ---------------------------------------------------------------
+Ref: concerns.specialty_id > specialties.id
+
+// -- Consultation and money --------------------------------------------------
+Ref: consultations.patient_id > patients.id
+Ref: consultations.doctor_id > doctors.id
+Ref: consultations.specialty_id > specialties.id
+Ref: consultations.concern_id > concerns.id
+Ref: consultations.rescheduled_from_consultation_id > consultations.id
+Ref: consultations.followup_pathway_id > followup_pathways.id
+Ref: consultation_participants.consultation_id > consultations.id
+Ref: instant_consultancy.consultation_id > consultations.id
+Ref: instant_consultancy.doctor_id > doctors.id
+Ref: payments.consultation_id - consultations.id
+Ref: payments.refund_initiated_by_admin_id > admins.id
+Ref: clinical_records.consultation_id - consultations.id
+
+// -- Clinical and files ------------------------------------------------------
+Ref: patient_files.patient_id > patients.id
+Ref: patient_files.uploaded_by_doctor_id > doctors.id
+Ref: patient_files.consultation_id > consultations.id
+Ref: patient_files.report_request_id > report_requests.id
+Ref: patient_files.clarification_case_id > clarification_cases.id
+Ref: report_requests.consultation_id > consultations.id
+
+// -- Follow-up and safety ----------------------------------------------------
+Ref: checkin_responses.consultation_id > consultations.id
+Ref: safety_alerts.consultation_id > consultations.id
+Ref: safety_alerts.checkin_response_id > checkin_responses.id
+Ref: safety_alerts.acknowledged_by_admin_id > admins.id
+Ref: safety_alerts.acknowledged_by_doctor_id > doctors.id
+
+// -- Clarification and content -----------------------------------------------
+Ref: clarification_cases.treating_doctor_id > doctors.id
+Ref: clarification_cases.expert_doctor_id > doctors.id
+Ref: clarification_cases.source_consultation_id > consultations.id
+Ref: content_items.concern_id > concerns.id
+Ref: content_items.specialty_id > specialties.id
+Ref: content_items.reviewed_by_admin_id > admins.id
+
+// -- Legal and platform ------------------------------------------------------
+Ref: complaints.patient_id > patients.id
+Ref: complaints.consultation_id > consultations.id
+Ref: complaints.assigned_to_admin_id > admins.id
+Ref: consents.patient_id > patients.id
+Ref: consents.doctor_id > doctors.id
+Ref: consents.legal_document_id > legal_documents.id
+Ref: data_deletion_requests.patient_id > patients.id
+Ref: data_deletion_requests.reviewed_by_admin_id > admins.id
+Ref: notifications.patient_id > patients.id
+Ref: notifications.doctor_id > doctors.id
+Ref: notifications.admin_id > admins.id
+Ref: notifications.consultation_id > consultations.id
+
+// ############################################################################
+// TABLE GROUPS
+// ############################################################################
+
+TableGroup "Accounts" {
+  patients
+  admins
+}
+
+TableGroup "Doctors" {
+  doctors
+  doctor_documents
+  doctor_availability
+}
+
+TableGroup "Catalogue" {
+  specialties
+  concerns
+}
+
+TableGroup "Consultation and Money" {
+  consultations
+  consultation_participants
+  instant_consultancy
+  payments
+}
+
+TableGroup "Clinical and Files" {
+  clinical_records
+  patient_files
+  report_requests
+}
+
+TableGroup "Follow-up and Safety" {
+  followup_pathways
+  checkin_responses
+  safety_alerts
+}
+
+TableGroup "Clarification and Content" {
+  clarification_cases
+  content_items
+}
+
+TableGroup "Legal and Platform" {
+  complaints
+  legal_documents
+  consents
+  data_deletion_requests
+  notifications
+  app_config
+  audit_log
+}

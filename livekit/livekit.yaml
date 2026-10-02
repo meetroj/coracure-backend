@@ -1,0 +1,87 @@
+# LiveKit Server - LOCAL DEVELOPMENT configuration.
+#
+# This is the media plane. It is a separate process from the API and never runs
+# inside it: the API authenticates, authorises and mints join tokens, and the
+# audio and video go client <-> LiveKit <-> client without passing through us
+# (LiveKit_strategy 2, 26).
+#
+# The shape of this file is deliberately the shape of the production one, so
+# that the AWS deployment is a change of values rather than a change of design
+# (LiveKit_strategy 32). What differs there is listed at the bottom.
+
+port: 7880
+ 
+rtc:
+  # WebRTC over TCP, for the clients whose network will not pass UDP. Published
+  # on the host so the fallback can actually be exercised locally rather than
+  # discovered for the first time in production.
+  tcp_port: 7881
+  # The UDP media range. Kept SMALL here on purpose: docker publishes each port
+  # in the range individually, and the production 50000-60000 would take minutes
+  # to start and exhausts the host's port table. AWS gets the full range,
+  # because there it is a security-group rule rather than 10,000 forwards.
+  port_range_start: 50000
+  port_range_end: 50019
+  # Everything is on this machine, so the address LiveKit advertises to a client
+  # is a loopback address and there is no NAT to discover. On EC2 this becomes
+  # `use_external_ip: true`, which is what makes LiveKit advertise the public
+  # address rather than the private interface it actually binds (strategy 22).
+  use_external_ip: false
+  # Docker Desktop's container IP is not reachable from host browsers.
+  # Advertise the host's published ports for same-computer development calls.
+  node_ip: 127.0.0.1
+
+# *** DEVELOPMENT CREDENTIALS. PUBLIC BY DESIGN. ***
+#
+# Committed so that `docker compose up` works with no setup, which also means
+# they are worth exactly nothing as a secret. `env.validation` refuses `devkey`
+# in production for that reason. Production keys are generated per environment
+# and come from the secret store, never from a file in the repository
+# (LiveKit_strategy 13, 31).
+keys:
+  devkey: devsecretdevsecretdevsecretdevsecret
+
+logging:
+  level: info
+  # One line per event, so the container's output goes into the same log
+  # pipeline as the API's rather than needing its own parser.
+  json: true
+
+# Room lifecycle. A consultation room is created on demand by the first join -
+# nothing pre-creates it, because the room's NAME is a function of the
+# consultation id and so it needs no registration to exist.
+room:
+  # Long enough for the doctor to arrive after the patient, and short enough
+  # that an abandoned room does not sit open. `room_finished` fires when it
+  # closes, which is what moves the consultation on to documentation.
+  empty_timeout: 300
+  # A consultation is two people. LiveKit enforces it as well as we do: the
+  # token is only ever minted for the assigned patient and the assigned doctor,
+  # and this is the second, independent ceiling on that (SRS FR-8.5).
+  max_participants: 2
+
+webhook:
+  # Signed with the key below, verified by the API before a single field is
+  # read. These webhooks are the ONLY writer of `consultation_participants`.
+  api_key: devkey
+  urls:
+    # `host.docker.internal` is the host from inside the container, which is
+    # where the API runs in development. In production both sides have real
+    # DNS names and this is the API's public URL.
+    - http://host.docker.internal:3000/api/v1/video/webhook
+
+# ---------------------------------------------------------------------------
+# WHAT PRODUCTION CHANGES (LiveKit_strategy 16-24)
+#
+#   keys              a generated pair per environment, from the secret store
+#   rtc.use_external_ip  true - EC2 binds a private address, clients reach a
+#                        public one, and WebRTC must advertise the reachable one
+#   rtc.port_range    50000-60000, opened as a security-group rule
+#   webhook.urls      the API's https URL
+#   turn              enabled with a domain and certificate, for the clients
+#                     that cannot get a direct UDP path out at all
+#   TLS               terminated by Caddy in front of this, never here
+#
+# NOT here in any environment: egress. Nothing is recorded (FR-8.6), so there
+# is no recorder, no S3 bucket and no retention question to answer.
+# ---------------------------------------------------------------------------

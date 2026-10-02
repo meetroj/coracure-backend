@@ -1,0 +1,231 @@
+# Coracure API - build, publish and deploy.
+#
+# Split in two on purpose. `publish` runs on every green main and produces an
+# immutable, sha-tagged image. `deploy` is a separate job behind a GitHub
+# Environment, so promoting to production is an approval rather than a merge.
+#
+# The release ORDER is not incidental (DEPLOYMENT.md, "Release order"):
+# migrations are applied by running the SAME image that is about to serve, as
+# one task rather than on every instance, so the schema and the code can never
+# disagree.
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to deploy
+        type: choice
+        options: [staging, production]
+        default: staging
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '22'
+  NPM_VERSION: '11'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Everything CI checks, again, on the merge commit. A pull request is tested
+  # against a MERGE of the branch and main as it was when the run started; main
+  # can have moved since. This is the gate that the artefact is built from.
+  # ---------------------------------------------------------------------------
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm install -g npm@${{ env.NPM_VERSION }}
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run test:e2e
+
+  publish:
+    name: Publish image to ECR
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: [verify]
+    permissions:
+      contents: read
+      id-token: write # OIDC: no long-lived AWS keys live in this repository
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # The immutable tag is the commit sha. `main` is a moving convenience tag
+      # for humans; nothing deploys by it, because "which build is running"
+      # must have exactly one answer.
+      - id: meta
+        run: |
+          registry='${{ steps.ecr.outputs.registry }}'
+          repo='${{ vars.ECR_REPOSITORY }}'
+          echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "image=${registry}/${repo}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          provenance: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:main
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy ${{ github.event.inputs.environment || 'staging' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [publish]
+    # Approvals, environment secrets and the deployment history all hang off
+    # this. Configure required reviewers on `production` in repository settings;
+    # without that, this line is decoration.
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Step 1 of the release order. One task, not every instance. It runs the
+      # image being deployed, so the migrations applied are exactly the ones
+      # that image was built from.
+      #
+      # Sent through SSM rather than SSH: no inbound port, no key to rotate, and
+      # the command and its output are recorded in CloudTrail.
+      #
+      # The prune runs FIRST, before the pull, and that ordering is the whole
+      # point. Each API image is ~766MB on an 8GB volume shared with Postgres,
+      # so a few deploys fill the disk; freeing space after a failed pull is too
+      # late, and the pull fails HERE - between the migration being applied and
+      # the new container starting, the worst point in a release to run out of
+      # disk.
+      #
+      # No `until=` filter: six deploys in one day all sit inside any sensible
+      # window, and the box reached 86% proving it. Keeping local images as
+      # rollback targets was the wrong instinct anyway - ECR holds every image,
+      # tagged by sha, so a rollback is a `docker pull` and the local copy is a
+      # convenience, not the safety net.
+      #
+      # Docker never prunes an image a container is using, so the running one is
+      # safe, and `|| true` keeps a prune failure from failing a good deploy.
+      - name: Apply migrations
+        run: |
+          set -euo pipefail
+          command_id=$(aws ssm send-command \
+            --targets "Key=tag:Name,Values=${{ vars.EC2_NAME_TAG }}" \
+            --document-name AWS-RunShellScript \
+            --comment "coracure migrate ${{ needs.publish.outputs.tag }}" \
+            --parameters commands="[
+              'set -euo pipefail',
+              'docker image prune -af || true',
+              'aws ecr get-login-password --region ${{ vars.AWS_REGION }} | docker login --username AWS --password-stdin ${{ needs.publish.outputs.image }}',
+              'docker pull ${{ needs.publish.outputs.image }}:${{ needs.publish.outputs.tag }}',
+              'docker run --rm --network coracure --env-file /etc/coracure/api.env ${{ needs.publish.outputs.image }}:${{ needs.publish.outputs.tag }} npm run db:migrate'
+            ]" \
+            --query 'Command.CommandId' --output text)
+          echo "ssm command: $command_id"
+          aws ssm wait command-executed \
+            --command-id "$command_id" \
+            --instance-id "$(aws ec2 describe-instances \
+              --filters 'Name=tag:Name,Values=${{ vars.EC2_NAME_TAG }}' 'Name=instance-state-name,Values=running' \
+              --query 'Reservations[0].Instances[0].InstanceId' --output text)"
+
+      # Step 2. Roll the service. `docker stop --time 30` must exceed the
+      # longest in-flight request.
+      #
+      # `--network coracure` is required, not optional: Postgres runs as a
+      # container on that network and publishes NO host port, so the API can
+      # only reach it by container name from inside the network.
+      #
+      # The container publishes on 127.0.0.1 ONLY. nginx terminates TLS and
+      # proxies to it, so port 3000 must never be reachable from outside the
+      # host - published on 0.0.0.0 it would answer in clear text and bypass
+      # every header nginx sets, including the X-Forwarded-For that the audit
+      # log records as the client.
+      - name: Roll the service
+        run: |
+          set -euo pipefail
+          instance_id=$(aws ec2 describe-instances \
+            --filters 'Name=tag:Name,Values=${{ vars.EC2_NAME_TAG }}' 'Name=instance-state-name,Values=running' \
+            --query 'Reservations[0].Instances[0].InstanceId' --output text)
+          command_id=$(aws ssm send-command \
+            --instance-ids "$instance_id" \
+            --document-name AWS-RunShellScript \
+            --comment "coracure deploy ${{ needs.publish.outputs.tag }}" \
+            --parameters commands="[
+              'set -euo pipefail',
+              'docker stop --time 30 coracure-api || true',
+              'docker rm coracure-api || true',
+              'docker run -d --name coracure-api --restart unless-stopped --network coracure -p 127.0.0.1:3000:3000 --env-file /etc/coracure/api.env --log-driver awslogs --log-opt awslogs-group=/coracure/api --log-opt awslogs-region=${{ vars.AWS_REGION }} ${{ needs.publish.outputs.image }}:${{ needs.publish.outputs.tag }}'
+            ]" \
+            --query 'Command.CommandId' --output text)
+          aws ssm wait command-executed --command-id "$command_id" --instance-id "$instance_id"
+
+      # Readiness, not liveness. `/health` checks nothing; `/health/ready` runs
+      # SELECT 1, so this proves the new container can actually reach its
+      # database rather than merely that a process is listening. It goes through
+      # nginx over TLS, so it also proves the proxy is up and the certificate is
+      # servable - two things that fail independently of the container.
+      #
+      # TLS verification is skipped ONLY while HEALTH_URL is a bare IP address,
+      # because Let's Encrypt will not issue for one and the certificate there
+      # is a self-signed placeholder. The moment HEALTH_URL becomes a hostname,
+      # this verifies strictly again with no edit needed - which is the point:
+      # a hardcoded `--insecure` would silently outlive the reason for it and
+      # stop noticing a broken certificate on a real domain.
+      - name: Verify readiness
+        run: |
+          set -euo pipefail
+          url='${{ vars.HEALTH_URL }}'
+          host=$(printf '%s' "$url" | sed -E 's#^[a-z]+://##; s#[/:].*##')
+          insecure=''
+          if printf '%s' "$host" | grep -qE '^[0-9]+(\.[0-9]+){3}$'; then
+            insecure='--insecure'
+            echo "::warning::$host is a bare IP, so the certificate is the self-signed placeholder and TLS is NOT being verified. Point HEALTH_URL at a real domain to restore verification."
+          fi
+          for i in $(seq 1 30); do
+            if body=$(curl -fsS $insecure --max-time 10 "$url"); then
+              echo "ready: $body"; exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::$url never returned ready"
+          exit 1

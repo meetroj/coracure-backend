@@ -1,0 +1,1816 @@
+// Prisma models mirror db/schema.dbml, which stays the authoritative data model.
+// Only the tables M-01 owns exist here; each module adds its own as it is built.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum ActorType {
+  patient
+  doctor
+  admin
+  system
+
+  @@map("actor_type")
+}
+
+enum AuditAction {
+  create
+  read
+  update
+  delete
+  export
+  login
+  verify
+  webhook
+
+  @@map("audit_action")
+}
+
+/// Everything an admin can change without a release, as JSON values.
+/// Secrets are NEVER stored here. Change history is the audit log.
+model AppConfig {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  key         String   @unique @db.VarChar(160)
+  value       Json
+  description String?
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("app_config")
+}
+
+/// Append-only. No foreign key on purpose: an entry must outlive whatever it
+/// describes, and the actor may be any of the three account kinds.
+model AuditLog {
+  id             BigInt      @id @default(autoincrement())
+  actorType      ActorType   @map("actor_type")
+  actorId        String?     @map("actor_id") @db.Uuid
+  action         AuditAction
+  entityType     String      @map("entity_type") @db.VarChar(80)
+  entityId       String      @map("entity_id") @db.VarChar(80)
+  consultationId String?     @map("consultation_id") @db.Uuid
+  metadata       Json?
+  ipAddress      String?     @map("ip_address") @db.Inet
+  createdAt      DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([actorType, actorId, createdAt])
+  @@index([entityType, entityId])
+  @@index([action, createdAt])
+  @@index([consultationId])
+  @@map("audit_log")
+}
+
+// ---------------------------------------------------------------------------
+// M-02 Identity and Access. Owns `patients` and `admins`; `doctors` arrives
+// with M-05, which holds registration and verification state.
+// ---------------------------------------------------------------------------
+
+enum AccountStatus {
+  pending
+  active
+  suspended
+  deleted
+
+  @@map("account_status")
+}
+
+enum Gender {
+  male
+  female
+  other
+  undisclosed
+
+  @@map("gender")
+}
+
+enum AdminPermissionLevel {
+  super_admin
+  operations
+  clinical_governance
+  care_coordinator
+  finance
+  content
+
+  @@map("admin_permission_level")
+}
+
+/// Self sign-up by mobile OTP. No password, ever - Slide owns the challenge
+/// and the row is only written once Slide confirms it, so the row existing IS
+/// the verification and there is no `mobile_verified_at`.
+model Patient {
+  id                String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  status            AccountStatus @default(pending)
+  /// The sign-in identifier, stored in E.164 form (+919876543210).
+  mobileNumber      String        @unique @map("mobile_number") @db.VarChar(16)
+  fullName          String?       @map("full_name") @db.VarChar(160)
+  /// Age is derived from this, never stored.
+  dateOfBirth       DateTime?     @map("date_of_birth") @db.Date
+  gender            Gender        @default(undisclosed)
+  /// *** MATCHED ON *** a provider who does not speak this is never assigned
+  /// to this patient (FR-20.4). Language is never relaxed; region is.
+  preferredLanguage String        @default("en") @map("preferred_language") @db.VarChar(40)
+  /// The state the patient is in. A PREFERENCE for assignment, relaxed when the
+  /// region pool cannot cover the request (FR-20.5).
+  regionId          String?       @map("region_id") @db.Uuid
+  /// *** REVOCATION *** every token carries a `ver` claim; bump to refuse them all.
+  tokenVersion      Int           @default(0) @map("token_version") @db.SmallInt
+  /// FCM delivers to both platforms, so the platform is not a column.
+  pushToken         String?       @map("push_token")
+  deviceId          String?       @map("device_id") @db.VarChar(120)
+  createdAt         DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime      @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  region           Region?               @relation(fields: [regionId], references: [id])
+  consents         Consent[]
+  deletionRequests DataDeletionRequest[]
+  notifications    Notification[]
+  complaints       Complaint[]
+  files            PatientFile[]
+  consultations    Consultation[]
+
+  @@index([status])
+  @@index([pushToken])
+  /// The pair every assignment starts from.
+  @@index([regionId, preferredLanguage])
+  @@map("patients")
+}
+
+/// Created by another admin, never self-registered. Email and password, on a
+/// desktop browser (SRS 2.3) - which is why there is no push token here.
+model Admin {
+  id              String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  status          AccountStatus        @default(active)
+  /// The sign-in identifier.
+  email           String               @unique @db.VarChar(255)
+  passwordHash    String               @map("password_hash")
+  /// When true, a Slide OTP challenge follows password verification.
+  is2faEnabled    Boolean              @default(false) @map("is_2fa_enabled")
+  fullName        String               @map("full_name") @db.VarChar(160)
+  /// Gates which panel sections and data this admin sees.
+  permissionLevel AdminPermissionLevel @map("permission_level")
+  /// *** REVOCATION *** as on `patients`.
+  tokenVersion    Int                  @default(0) @map("token_version") @db.SmallInt
+  createdAt       DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime             @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  reviewedDeletionRequests DataDeletionRequest[]
+  verifiedDoctors          Doctor[]              @relation("DoctorVerifier")
+  reviewedDocuments        DoctorDocument[]      @relation("DocumentReviewer")
+  notifications            Notification[]
+  initiatedRefunds         Payment[]             @relation("RefundInitiator")
+  acknowledgedAlerts       SafetyAlert[]         @relation("AlertAcknowledgedByAdmin")
+  reviewedContent          ContentItem[]         @relation("ContentReviewer")
+  assignedComplaints       Complaint[]           @relation("ComplaintAssignee")
+
+  @@index([permissionLevel, status])
+  @@map("admins")
+}
+
+// ---------------------------------------------------------------------------
+// M-03 Consent and Legal. Owns `legal_documents`, `consents` and
+// `data_deletion_requests`.
+// ---------------------------------------------------------------------------
+
+enum LegalDocumentType {
+  teleconsultation_consent
+  privacy_policy
+  terms_of_use
+  refund_policy
+  reconsult_policy
+  doctor_agreement
+
+  @@map("legal_document_type")
+}
+
+enum DeletionStatus {
+  requested
+  in_review
+  approved
+  rejected
+  executed
+  failed
+
+  @@map("deletion_status")
+}
+
+/// Legal copy, versioned by ROW. A version anyone has accepted is NEVER
+/// edited - a change is a new row, so a `consents` row can always show exactly
+/// what its holder agreed to.
+model LegalDocument {
+  id           String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  documentType LegalDocumentType @map("document_type")
+  /// Client-set, e.g. "1.0", "2026-08".
+  version      String            @db.VarChar(20)
+  title        String            @db.VarChar(200)
+  body         String
+  /// The version new users must accept. One per type, enforced by a partial index.
+  isCurrent    Boolean           @default(false) @map("is_current")
+  createdAt    DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  consents Consent[]
+
+  @@unique([documentType, version])
+  @@index([documentType, isCurrent])
+  @@map("legal_documents")
+}
+
+/// Append-only legal evidence of acceptance. Never updated, never deleted.
+model Consent {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  /// Exactly one of these is set - a CHECK in the migration enforces it.
+  patientId String? @map("patient_id") @db.Uuid
+  doctorId  String? @map("doctor_id") @db.Uuid
+
+  /// Pins the exact version accepted, which is why there is no `version` column.
+  legalDocumentId String            @map("legal_document_id") @db.Uuid
+  /// Denormalised so the pre-consult check needs no join. A composite foreign
+  /// key to (id, document_type) makes disagreeing with the document impossible.
+  documentType    LegalDocumentType @map("document_type")
+  acceptedAt      DateTime          @default(now()) @map("accepted_at") @db.Timestamptz(6)
+  /// The one IP address kept outside `audit_log`: it is the legal evidence of
+  /// acceptance, not a sign-in fact.
+  ipAddress       String?           @map("ip_address") @db.Inet
+
+  patient       Patient?      @relation(fields: [patientId], references: [id])
+  doctor        Doctor?       @relation(fields: [doctorId], references: [id])
+  legalDocument LegalDocument @relation(fields: [legalDocumentId], references: [id])
+
+  @@unique([patientId, legalDocumentId])
+  @@unique([doctorId, legalDocumentId])
+  @@index([patientId, documentType])
+  @@map("consents")
+}
+
+/// App Store guideline 5.1.1(v) and the DPDP Act. The evidence outlives the
+/// data it describes, so this row is never deleted by the run it records.
+model DataDeletionRequest {
+  id                String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  patientId         String         @map("patient_id") @db.Uuid
+  status            DeletionStatus @default(requested)
+  reason            String?
+  reviewedByAdminId String?        @map("reviewed_by_admin_id") @db.Uuid
+  reviewedAt        DateTime?      @map("reviewed_at") @db.Timestamptz(6)
+  reviewNote        String?        @map("review_note")
+  /// Written ONCE, at execution: per-table counts deleted or anonymised, what
+  /// was lawfully retained and on what ground, or why the run failed.
+  executionOutcome  Json?          @map("execution_outcome")
+  executedAt        DateTime?      @map("executed_at") @db.Timestamptz(6)
+  createdAt         DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  patient Patient @relation(fields: [patientId], references: [id])
+  admin   Admin?  @relation(fields: [reviewedByAdminId], references: [id])
+
+  @@index([status, createdAt])
+  @@index([patientId])
+  @@map("data_deletion_requests")
+}
+
+// ---------------------------------------------------------------------------
+// M-05 Doctor Registry and Verification. Owns `doctors` and `doctor_documents`.
+//
+// A doctor NEVER self-registers. An admin creates the account, the doctor
+// uploads credentials, an admin approves each credential separately, an admin
+// verifies the doctor, and an admin lists them. Those last two are separate
+// actions on purpose: verified says the papers are in order, listed says the
+// client wants patients to see them.
+// ---------------------------------------------------------------------------
+
+/// ONE lifecycle enum. There is no second `status` column - approval,
+/// rejection and suspension are states of the same thing.
+enum DoctorVerificationStatus {
+  pending
+  under_review
+  verified
+  rejected
+  suspended
+
+  @@map("doctor_verification_status")
+}
+
+enum DoctorSeniority {
+  standard
+  expert
+
+  @@map("doctor_seniority")
+}
+
+enum DoctorPresence {
+  offline
+  available_now
+  request_pending
+  in_consultation
+  completing_notes
+  paused
+  scheduled_only
+
+  @@map("doctor_presence")
+}
+
+enum DoctorDocumentType {
+  degree_certificate
+  registration_certificate
+  identity_proof
+  address_proof
+  experience_letter
+  profile_photo
+  signature
+  other
+
+  @@map("doctor_document_type")
+}
+
+enum DocumentReviewStatus {
+  pending
+  approved
+  rejected
+
+  @@map("document_review_status")
+}
+
+enum DoctorGender {
+  male
+  female
+  other
+  undisclosed
+
+  @@map("doctor_gender")
+}
+
+enum GovernmentIdType {
+  aadhaar
+  passport
+  driving_licence
+  voter_id
+  other
+
+  @@map("government_id_type")
+}
+
+/// Created by an admin (FR-1.2), signs in by mobile OTP like a patient.
+/// No reliability counters and no `active_consultation_id`: both are counted
+/// from `consultations` and `instant_consultancy` when a dashboard asks.
+model Doctor {
+  id               String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  /// The sign-in identifier, in E.164 form. An admin types it in weeks before
+  /// the doctor first signs in.
+  mobileNumber     String    @unique @map("mobile_number") @db.VarChar(16)
+  /// Null until an OTP sign-in proves somebody holds that number. Kept here and
+  /// NOT on `patients`, where the row only ever exists after verification.
+  mobileVerifiedAt DateTime? @map("mobile_verified_at") @db.Timestamptz(6)
+
+  /// *** REVOCATION *** as on `patients` and `admins`.
+  tokenVersion Int     @default(0) @map("token_version") @db.SmallInt
+  pushToken    String? @map("push_token")
+  deviceId     String? @map("device_id") @db.VarChar(120)
+
+  fullName  String  @map("full_name") @db.VarChar(160)
+  /// Profile copy shown on the doctor profile screen (FR-4.3).
+  bio       String?
+  /// Listings filter on this (FR-4.4). An array of language codes.
+  languages Json    @default("[]")
+
+  verificationStatus DoctorVerificationStatus @default(pending) @map("verification_status")
+  /// Medical council registration, shown in listings by FR-4.2.
+  registrationNumber String?                  @unique @map("registration_number") @db.VarChar(80)
+  qualification      String?                  @db.VarChar(255)
+  yearsOfExperience  Int?                     @map("years_of_experience") @db.SmallInt
+  /// The admin who approved the DOCTOR. Each document is signed off separately.
+  verifiedByAdminId  String?                  @map("verified_by_admin_id") @db.Uuid
+  verifiedAt         DateTime?                @map("verified_at") @db.Timestamptz(6)
+  /// The admin's own words when the application was turned down. Cleared on approval or reopen.
+  rejectionReason    String?                  @map("rejection_reason") @db.VarChar(255)
+
+  /// *** SELF-REGISTRATION *** - what the doctor states about themselves at
+  /// onboarding (`PUT /me/doctor/registration`), for an admin to verify. Never
+  /// shown to a patient: they see `qualification` and `yearsOfExperience`,
+  /// which a save derives from these.
+  dateOfBirth         DateTime?         @map("date_of_birth") @db.Date
+  gender              DoctorGender?
+  email               String?           @db.VarChar(254)
+  idType              GovernmentIdType? @map("id_type")
+  /// The document's name, only when `idType` is `other`.
+  idTypeName          String?           @map("id_type_name") @db.VarChar(60)
+  /// Returned to no client - reads get the last four characters.
+  idNumber            String?           @map("id_number") @db.VarChar(32)
+  abhaId              String?           @map("abha_id") @db.VarChar(60)
+  basicQualification  String?           @map("basic_qualification") @db.VarChar(120)
+  pgSpecialisation    String?           @map("pg_specialisation") @db.VarChar(120)
+  superSpecialisation String?           @map("super_specialisation") @db.VarChar(120)
+  fellowship          String?           @db.VarChar(120)
+
+  /// Admin-granted. `expert` is the only level that may be ASKED for a case
+  /// opinion (FR-1.6); it grants sight of nothing on its own.
+  seniorityLevel DoctorSeniority @default(standard) @map("seniority_level")
+  /// One specialty. It decides prescribing eligibility, the registration form
+  /// this provider was created on, and the price a patient pays for them.
+  specialtyId    String?         @map("specialty_id") @db.Uuid
+
+  /// *** WHAT THIS PROVIDER IS PAID *** - not what the patient is charged.
+  /// The patient price is `specialties.consultation_fee_inr`, because a patient
+  /// who cannot choose their provider must be quoted before one is assigned
+  /// (FR-7.8, FR-7.9).
+  consultationFeeInr          Decimal @default(0) @map("consultation_fee_inr") @db.Decimal(10, 2)
+  consultationDurationMinutes Int     @default(30) @map("consultation_duration_minutes") @db.SmallInt
+  bufferMinutes               Int     @default(5) @map("buffer_minutes") @db.SmallInt
+  /// Admin toggle, separate from verification. Search needs BOTH.
+  isListed                    Boolean @default(false) @map("is_listed")
+  allowInstantConsult         Boolean @default(false) @map("allow_instant_consult")
+  /// Admin-set once payout details are checked outside this system. No account
+  /// number or IFSC is ever stored here.
+  bankVerified                Boolean @default(false) @map("bank_verified")
+
+  /// Carried on the realtime channel by M-13; no heartbeat column.
+  presence                DoctorPresence @default(offline)
+  /// *** THE COMPLETION GATE *** (FR-10.5) set by M-15 while documentation is
+  /// outstanding.
+  blockedByConsultationId String?        @map("blocked_by_consultation_id") @db.Uuid
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  verifiedBy         Admin?               @relation("DoctorVerifier", fields: [verifiedByAdminId], references: [id])
+  /// `onDelete: Restrict` is stated rather than defaulted. The field is
+  /// optional, so Prisma would default to `SetNull` - but the migration built
+  /// `ON DELETE RESTRICT`, and the database is what enforces it. Left implicit,
+  /// the datamodel described behaviour the database does not have: deleting a
+  /// specialty reads as "the providers keep working, unassigned" and is in fact
+  /// refused outright while any provider still points at it.
+  specialty          Specialty?           @relation(fields: [specialtyId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  regions            DoctorRegion[]
+  documents          DoctorDocument[]
+  experience         DoctorExperience[]
+  availability       DoctorAvailability[]
+  notifications      Notification[]
+  uploadedFiles      PatientFile[]
+  consultations      Consultation[]
+  instantOffers      InstantConsultancy[]
+  blockedBy          Consultation?        @relation("CompletionGate", fields: [blockedByConsultationId], references: [id], onDelete: SetNull)
+  acknowledgedAlerts SafetyAlert[]        @relation("AlertAcknowledgedByDoctor")
+  clarificationCases ClarificationCase[]  @relation("TreatingDoctor")
+  expertCases        ClarificationCase[]  @relation("ExpertDoctor")
+  consents           Consent[]
+  clinicalTemplates  ClinicalTemplate[]
+
+  @@index([verificationStatus, isListed])
+  @@index([presence, allowInstantConsult])
+  @@index([specialtyId])
+  @@index([seniorityLevel])
+  @@index([pushToken])
+  @@map("doctors")
+}
+
+/// The doctor's own credentials. Separate from `patient_files` because the
+/// access rule differs: only admins and that doctor ever see these. A document
+/// is never edited - a rejected one is replaced by a fresh upload.
+model DoctorDocument {
+  id           String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  doctorId     String             @map("doctor_id") @db.Uuid
+  documentType DoctorDocumentType @map("document_type")
+
+  /// Object-store key. NEVER returned to a client - reads go through a
+  /// short-lived signed URL, so a link cannot be guessed or shared onward.
+  storageKey String @unique @map("storage_key")
+  fileName   String @map("file_name") @db.VarChar(255)
+
+  /// Each credential is approved or rejected on its own, with a reason.
+  reviewStatus      DocumentReviewStatus @default(pending) @map("review_status")
+  verifiedByAdminId String?              @map("verified_by_admin_id") @db.Uuid
+  verifiedAt        DateTime?            @map("verified_at") @db.Timestamptz(6)
+  rejectionReason   String?              @map("rejection_reason") @db.VarChar(255)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  doctor     Doctor @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  verifiedBy Admin? @relation("DocumentReviewer", fields: [verifiedByAdminId], references: [id])
+
+  @@index([doctorId, documentType])
+  @@index([reviewStatus, createdAt])
+  @@map("doctor_documents")
+}
+
+/// A doctor's own reusable prescription / advice plan. Applying one is a copy
+/// into a draft on the client, so nothing references a template once applied.
+/// `content` is {meds, advice, donts}, shaped and capped by the DTO.
+model ClinicalTemplate {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  doctorId    String   @map("doctor_id") @db.Uuid
+  name        String   @db.VarChar(80)
+  description String   @default("") @db.VarChar(300)
+  /// medication | advice | therapy | followUp - checked by the DTO.
+  kind        String   @db.VarChar(20)
+  specialty   String   @default("") @db.VarChar(60)
+  content     Json     @default("{}")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  doctor Doctor @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  @@index([doctorId])
+  @@map("clinical_templates")
+}
+
+/// One role the doctor states at onboarding. Replaced as a whole on every
+/// save, so there is no edit history to reconcile.
+model DoctorExperience {
+  id          String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  doctorId    String  @map("doctor_id") @db.Uuid
+  designation String  @db.VarChar(120)
+  institution String  @db.VarChar(160)
+  years       Decimal @db.Decimal(4, 1)
+  /// The experience certificate - a `doctor_documents` row of this doctor,
+  /// checked on write. ponytail: no FK, documents are never deleted; add one if that changes.
+  documentId  String? @map("document_id") @db.Uuid
+  sortOrder   Int     @map("sort_order") @db.SmallInt
+
+  doctor Doctor @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  @@index([doctorId, sortOrder])
+  @@map("doctor_experience")
+}
+
+// ---------------------------------------------------------------------------
+// M-06 Catalogue, Specialty and Allocation Configuration. Owns `specialties`,
+// `concerns` and `regions` - everything assignment matches against.
+//
+// `doctor_regions` is NOT owned here: which regions a provider serves is an
+// attribute of that provider, so M-05 owns it, exactly as M-05 owns
+// `doctors.specialty_id` while M-06 owns the specialty it points at.
+// ---------------------------------------------------------------------------
+
+/// Which of the two registration forms a specialty uses (FR-19.7). Held on the
+/// SPECIALTY, never on the provider: the specialty already decides the required
+/// credential list and prescribing, and a copy on the provider could disagree.
+enum ProviderType {
+  doctor
+  non_doctor
+
+  @@map("provider_type")
+}
+
+/// Adding a row here is how a new specialty goes live, on either registration
+/// form. No code change, no app release (FR-19.1).
+model Specialty {
+  id                 String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code               String       @unique @db.VarChar(60)
+  name               String       @db.VarChar(120)
+  description        String?
+  /// Decides which registration form an admin creates a provider on, and
+  /// therefore whether a medical council registration number is required.
+  providerType       ProviderType @default(non_doctor) @map("provider_type")
+  /// THE prescribing gate. Correlated with `providerType` at launch, but kept
+  /// separate: prescribing is a clinical permission, the form is a category.
+  canPrescribe       Boolean      @default(false) @map("can_prescribe")
+  /// *** WHAT THE PATIENT IS CHARGED *** quoted before a provider is assigned.
+  /// What each provider is PAID is on their own row.
+  consultationFeeInr Decimal      @default(0) @map("consultation_fee_inr") @db.Decimal(10, 2)
+  /// Ordered field list - key, label, input type, options, required.
+  intakeForm         Json?        @map("intake_form")
+  /// The medical-history block, asked only on a first consultation.
+  firstConsultForm   Json?        @map("first_consult_form")
+  /// `doctor_document_type` values a provider of this specialty must submit.
+  /// M-05's verification reads exactly this.
+  requiredDocuments  Json         @default("[]") @map("required_documents")
+  isActive           Boolean      @default(true) @map("is_active")
+  createdAt          DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime     @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  concerns      Concern[]
+  doctors       Doctor[]
+  consultations Consultation[]
+  contentItems  ContentItem[]
+
+  @@index([isActive])
+  @@map("specialties")
+}
+
+/// The concern taxonomy a symptom search maps onto. Search returns one of
+/// these, never a shortlist of providers (FR-5.1).
+model Concern {
+  id           String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  specialtyId  String  @map("specialty_id") @db.Uuid
+  code         String  @db.VarChar(60)
+  /// Also the plain-language match reason FR-5.4 shows.
+  name         String  @db.VarChar(120)
+  /// Trigger phrases and synonyms - English, Hindi and mixed.
+  matchPhrases Json    @default("[]") @map("match_phrases")
+  matchWeight  Int     @default(1) @map("match_weight") @db.SmallInt
+  isActive     Boolean @default(true) @map("is_active")
+
+  specialty     Specialty      @relation(fields: [specialtyId], references: [id], onDelete: Cascade)
+  consultations Consultation[]
+  contentItems  ContentItem[]
+
+  @@unique([specialtyId, code])
+  @@map("concerns")
+}
+
+/// A state or province (FR-20.11). Rows rather than an enum, so the client adds
+/// one from the panel with no release and the granularity can change later.
+model Region {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code      String   @unique @db.VarChar(60)
+  name      String   @db.VarChar(120)
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  doctors  DoctorRegion[]
+  patients Patient[]
+
+  @@index([isActive])
+  @@map("regions")
+}
+
+/// *** THE REGION POOL *** An admin puts a provider into the regions they
+/// serve (FR-18.9). Many-to-many, because a provider serves several states and
+/// each membership is a row an admin adds or removes on its own.
+///
+/// There is no language equivalent: what a provider speaks is already
+/// `doctors.languages`, and what a patient prefers is already on their row.
+model DoctorRegion {
+  doctorId  String   @map("doctor_id") @db.Uuid
+  regionId  String   @map("region_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  doctor Doctor @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  region Region @relation(fields: [regionId], references: [id], onDelete: Cascade)
+
+  @@id([doctorId, regionId])
+  @@index([regionId])
+  @@map("doctor_regions")
+}
+
+// ---------------------------------------------------------------------------
+// M-07 Availability and Scheduling. Owns `doctor_availability` - one table for
+// the weekly pattern, blocked dates, leave and date overrides.
+//
+// There is NO generated slots table, and that is deliberate. A slot row would
+// be a second copy of a fact the availability rules and the consultations
+// already state, it would have to be generated ahead of time for a horizon
+// nobody can pick, and every edit to a diary would have to rewrite it. Bookable
+// slots are COMPUTED: availability, minus blocks, minus what is already booked.
+// ---------------------------------------------------------------------------
+
+/// What kind of statement one availability row makes.
+///
+/// `weekly` is the standing pattern and carries `day_of_week`. `custom_hours`
+/// REPLACES that pattern for one date. `blocked` removes time: with no hours it
+/// is a day of leave, with hours it is a gap inside an otherwise normal day.
+enum AvailabilityRuleType {
+  weekly
+  blocked
+  custom_hours
+
+  @@map("availability_rule_type")
+}
+
+/// Remote channel only - SRS section 11 excludes in-person and provider
+/// travel from this release; every consultation is remote.
+enum ConsultationChannel {
+  video
+  audio
+
+  @@map("consultation_channel")
+}
+
+/// One statement about when a provider can be booked, in the platform's local
+/// wall clock (`PLATFORM_TIMEZONE`). Which columns are set depends on
+/// `rule_type`, and the CHECK constraints in the migration enforce that.
+///
+/// A rule that no longer applies is DELETED, not deactivated. There is no
+/// `is_active` and no free-text reason: a diary is a statement of fact about
+/// now, and who changed it and when is the `audit_log` row.
+model DoctorAvailability {
+  id       String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  doctorId String               @map("doctor_id") @db.Uuid
+  ruleType AvailabilityRuleType @map("rule_type")
+
+  /// 0 Sunday through 6 Saturday. Set only when `rule_type = weekly`.
+  dayOfWeek    Int?      @map("day_of_week") @db.SmallInt
+  /// Set only when `rule_type` is `blocked` or `custom_hours`.
+  specificDate DateTime? @map("specific_date") @db.Date
+
+  /// Local times, not instants. Both null on a `blocked` row means the whole
+  /// day - a day of leave - which is why they are nullable at all.
+  startTime DateTime? @map("start_time") @db.Time(6)
+  endTime   DateTime? @map("end_time") @db.Time(6)
+
+  /// Which remote channels this slot is offered on. Defaults to both so an
+  /// existing rule keeps working unchanged.
+  channels ConsultationChannel[] @default([video, audio])
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  doctor Doctor @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  @@index([doctorId, ruleType])
+  @@index([doctorId, specificDate])
+  @@map("doctor_availability")
+}
+
+// ---------------------------------------------------------------------------
+// M-08 Notifications. Owns `notifications` - one row per recipient, with
+// exactly one of `patient_id`, `doctor_id` and `admin_id` set.
+//
+// The copy is NOT here. Templates are an `app_config` value the admin edits,
+// so changing what a reminder says needs no release (FR-16.3). What is stored
+// on the row is the copy AS SENT, because the template may change afterwards
+// and a trail that rewrote itself would be no trail at all.
+//
+// There is no `app_client` column: the recipient column already implies which
+// app, and a second copy of that fact could disagree with it.
+// ---------------------------------------------------------------------------
+
+/// Delivery only. Whether the recipient READ it is `read_at` - there is no
+/// `read` member here saying the same thing in a second place.
+enum NotificationStatus {
+  queued
+  sent
+  failed
+
+  @@map("notification_status")
+}
+
+/// One notification to one recipient.
+model Notification {
+  id BigInt @id @default(autoincrement())
+
+  /// *** EXACTLY ONE OF THESE *** enforced by a CHECK in the migration.
+  patientId String? @map("patient_id") @db.Uuid
+  doctorId  String? @map("doctor_id") @db.Uuid
+  /// Read in the panel. An admin row has no push token to deliver to.
+  adminId   String? @map("admin_id") @db.Uuid
+
+  /// Which template this was rendered from. A varchar and NOT an enum: the copy
+  /// behind each code is admin-editable data, so adding a code must not need a
+  /// migration. The known codes are `NOTIFICATION_TEMPLATES` in code.
+  templateCode String @map("template_code") @db.VarChar(80)
+
+  title String @db.VarChar(200)
+  /// The copy AS SENT. MUST NOT name a diagnosis (FR-16.2), which is checked
+  /// when an admin saves a template and again on the rendered text.
+  body  String
+
+  deepLinkData   Json?   @map("deep_link_data")
+  /// No relation yet: `consultations` arrives with M-11, which adds the key.
+  consultationId String? @map("consultation_id") @db.Uuid
+
+  status        NotificationStatus @default(queued)
+  sentAt        DateTime?          @map("sent_at") @db.Timestamptz(6)
+  /// Set = read. Nothing else records that.
+  readAt        DateTime?          @map("read_at") @db.Timestamptz(6)
+  failureReason String?            @map("failure_reason") @db.VarChar(200)
+  createdAt     DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  patient Patient? @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  doctor  Doctor?  @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  admin   Admin?   @relation(fields: [adminId], references: [id], onDelete: Cascade)
+
+  @@index([patientId, createdAt])
+  @@index([doctorId, createdAt])
+  @@index([adminId, createdAt])
+  @@index([status, createdAt])
+  @@map("notifications")
+}
+
+// ---------------------------------------------------------------------------
+// M-10 Documents and File Storage. Owns `patient_files` and `report_requests`.
+//
+// Doctor credentials are NOT here. They are `doctor_documents`, owned by M-05,
+// because the access rule is a different one: a credential is read by the
+// doctor who uploaded it and by any reviewing admin, while a patient file is
+// read by that patient and only by a doctor treating them.
+// ---------------------------------------------------------------------------
+
+/// What a patient file IS, which is also what decides where it may be reached
+/// from. Named `patient_file_category` and not `document_type` so it can never
+/// be confused with `doctor_document_type` or `legal_document_type`.
+enum PatientFileCategory {
+  /// Held against the PATIENT, not a booking: uploaded before any consultation
+  /// exists and still readable at every later one.
+  medical_history
+  report
+  photo
+  /// Generated by the platform, not uploaded. Written by M-15 when it renders
+  /// the record a doctor has just finalised.
+  prescription_pdf
+  /// A DE-IDENTIFIED copy for an expert opinion. `patient_id` is null on these.
+  clarification_attachment
+
+  @@map("patient_file_category")
+}
+
+enum ReportRequestStatus {
+  open
+  fulfilled
+  cancelled
+
+  @@map("report_request_status")
+}
+
+/// Coarse bucket the app filters/groups by. `title` stays free text for the
+/// actual ask.
+enum ReportRequestCategory {
+  prescription
+  lab
+  history
+  other
+
+  @@map("report_request_category")
+}
+
+/// One clinical file. Served only through short-lived signed URLs minted after
+/// an ownership check - `storage_key` is never returned to any client.
+///
+/// No `size_bytes` and no `mime_type`: the object store is authoritative for
+/// both, it serves the Content-Type the file was uploaded with, and the preview
+/// icon comes off the file name's extension.
+model PatientFile {
+  id           String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  fileCategory PatientFileCategory @map("file_category")
+
+  /// Set for every clinical file, so history predating any booking is still
+  /// readable. Null ONLY on a de-identified clarification attachment.
+  patientId          String? @map("patient_id") @db.Uuid
+  /// Set when a DOCTOR uploaded on the patient's behalf. Null means the patient
+  /// uploaded it themselves - a patient can only ever upload their own file, so
+  /// that case needs no column of its own.
+  uploadedByDoctorId String? @map("uploaded_by_doctor_id") @db.Uuid
+
+  /// Null when the file belongs to the patient rather than to one booking.
+  consultationId      String? @map("consultation_id") @db.Uuid
+  /// Set when uploaded against a doctor's request, so the file arrives
+  /// LABELLED - and so the request is fulfilled without a second timestamp.
+  reportRequestId     String? @map("report_request_id") @db.Uuid
+  /// Set for a de-identified attachment. M-12's table; no key until it exists.
+  clarificationCaseId String? @map("clarification_case_id") @db.Uuid
+
+  /// Object-store key. NEVER returned to a client - reads go through a
+  /// short-lived signed URL, so a link cannot be guessed or shared onward.
+  storageKey String @unique @map("storage_key")
+  fileName   String @map("file_name") @db.VarChar(255)
+
+  /// Soft delete. Set = deleted; there is no separate `is_deleted` flag.
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(6)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  patient           Patient?           @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  consultation      Consultation?      @relation(fields: [consultationId], references: [id], onDelete: NoAction)
+  /// NoAction, not the default SetNull. A doctor row is never hard-deleted -
+  /// they are suspended - but if one ever were, nulling this column would make
+  /// the file read as though the PATIENT had uploaded it, because that is
+  /// exactly what a null here means. That would rewrite who wrote a clinical
+  /// record, and would let the patient delete it.
+  uploadedBy        Doctor?            @relation(fields: [uploadedByDoctorId], references: [id], onDelete: NoAction)
+  reportRequest     ReportRequest?     @relation(fields: [reportRequestId], references: [id])
+  /// The de-identified case this copy was attached to. CASCADE: an attachment
+  /// has no meaning without the case, and the CHECK above already guarantees
+  /// such a row carries no patient.
+  clarificationCase ClarificationCase? @relation(fields: [clarificationCaseId], references: [id], onDelete: Cascade)
+
+  @@index([patientId, fileCategory])
+  @@index([consultationId])
+  @@index([reportRequestId])
+  @@index([clarificationCaseId])
+  @@map("patient_files")
+}
+
+/// A doctor asking the patient for a document, in any session (FR-4.9).
+///
+/// Patient and doctor are read THROUGH the consultation - the treating doctor
+/// is always `consultations.doctor_id`, so neither is a column here. There is
+/// no `fulfilled_at` either: the arriving `patient_files` row carries that time
+/// in its own `created_at`. And no `due_by`: no requirement sets a deadline or
+/// chases one.
+model ReportRequest {
+  id             String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  consultationId String @map("consultation_id") @db.Uuid
+
+  /// What is needed.
+  title    String                @db.VarChar(160)
+  category ReportRequestCategory @default(other)
+  /// Why - shown to the patient, so the file that comes back is the right one.
+  reason   String?
+
+  status    ReportRequestStatus @default(open)
+  createdAt DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  consultation Consultation  @relation(fields: [consultationId], references: [id], onDelete: Cascade)
+  files        PatientFile[]
+
+  @@index([consultationId, status])
+  @@index([status, createdAt])
+  @@map("report_requests")
+}
+
+// ---------------------------------------------------------------------------
+// M-11 Booking. Owns `consultations` - THE SPINE.
+//
+// Booking and consultation are ONE row, and `consultations.id` IS the
+// consultation ID that every clinical and financial record hangs from. A row
+// with status `pending_payment` IS the slot hold; there is no separate holds
+// table, because a hold and the booking it becomes are the same appointment at
+// two moments.
+//
+// Assignment adds NO column beyond `doctor_id`, which the row already has. What
+// the assignment matched on is an `audit_log` entry: the consultation records
+// WHO, the log records WHY, and why is a record of a decision rather than an
+// attribute of the appointment.
+//
+// What is deliberately NOT here:
+//   no scheduled_end_at        = scheduled_start_at + duration_minutes
+//   no video_duration          = summed from consultation_participants (M-14)
+//   no started_at / ended_at   = min/max of consultation_participants
+//   no livekit_room_name       = a pure function of this row's id
+//   no clinically_completed_at = clinical_records.finalised_at (M-15)
+//   no is_first_consultation   = no earlier consultation for this patient
+//   no no_show_party           = the party with no participant row
+//   no decline counter         = the audit entries for this consultation
+// ---------------------------------------------------------------------------
+
+enum ConsultationMode {
+  scheduled
+  instant
+
+  @@map("consultation_mode")
+}
+
+enum ConsultationStatus {
+  /// The slot hold. A sweep expires it if checkout is abandoned.
+  pending_payment
+  scheduled
+  awaiting_doctor
+  in_progress
+  awaiting_documentation
+  completed
+  cancelled
+  no_show
+  /// A hold that ran out. Distinct from `cancelled`: nobody decided this.
+  expired
+
+  @@map("consultation_status")
+}
+
+/// Who acted. Used for cancellation, and by later modules for the same question.
+enum Party {
+  patient
+  doctor
+  admin
+  system
+
+  @@map("party")
+}
+
+enum FollowupStatus {
+  none
+  active
+  completed
+  /// The state no date arithmetic can produce, which is why this column stays.
+  cancelled
+
+  @@map("followup_status")
+}
+
+model Consultation {
+  id            String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  /// Human-quotable, for support and for the patient's own reference.
+  referenceCode String @unique @map("reference_code") @db.VarChar(24)
+
+  patientId   String  @map("patient_id") @db.Uuid
+  /// NULL only while an instant request is still searching for a doctor.
+  doctorId    String? @map("doctor_id") @db.Uuid
+  /// BOOKING-TIME SNAPSHOT, and not derivable: `concern_id` and `doctor_id` are
+  /// both nullable, and instant routing needs a specialty BEFORE any doctor.
+  specialtyId String  @map("specialty_id") @db.Uuid
+  concernId   String? @map("concern_id") @db.Uuid
+
+  mode    ConsultationMode
+  /// Video or audio call, chosen at booking against the slot doctor_availability
+  /// offered. In-person is out of scope for this release (SRS section 11).
+  channel ConsultationChannel @default(video)
+  status  ConsultationStatus  @default(pending_payment)
+
+  scheduledStartAt DateTime? @map("scheduled_start_at") @db.Timestamptz(6)
+  durationMinutes  Int       @map("duration_minutes") @db.SmallInt
+  /// While `pending_payment` this row IS the slot hold; a sweep expires it.
+  holdExpiresAt    DateTime? @map("hold_expires_at") @db.Timestamptz(6)
+
+  /// Snapshot of the answers to the specialty's intake form, including whatever
+  /// free-text field that form carries. There is no separate patient_note.
+  intakeAnswers Json? @map("intake_answers")
+
+  rescheduledFromConsultationId String?   @map("rescheduled_from_consultation_id") @db.Uuid
+  cancelledAt                   DateTime? @map("cancelled_at") @db.Timestamptz(6)
+  cancelledByParty              Party?    @map("cancelled_by_party")
+  cancellationReason            String?   @map("cancellation_reason") @db.VarChar(200)
+
+  /// The follow-up plan. Written by M-16, which owns the pathway it points at.
+  followupPathwayId     String?        @map("followup_pathway_id") @db.Uuid
+  followupStartsOn      DateTime?      @map("followup_starts_on") @db.Date
+  followupStatus        FollowupStatus @default(none) @map("followup_status")
+  /// FR-13.8: DOCTOR-added daily questions for THIS patient only, on top of the
+  /// pathway set. They carry no red-flag rules, so safety alerting stays on the
+  /// clinician-approved set.
+  extraCheckinQuestions Json           @default("[]") @map("extra_checkin_questions")
+
+  /// 1 to 5. Set = feedback submitted, so there is no `feedback_at`.
+  feedbackRating  Int?    @map("feedback_rating") @db.SmallInt
+  feedbackComment String? @map("feedback_comment")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  patient         Patient        @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  doctor          Doctor?        @relation(fields: [doctorId], references: [id], onDelete: NoAction)
+  specialty       Specialty      @relation(fields: [specialtyId], references: [id], onDelete: NoAction)
+  concern         Concern?       @relation(fields: [concernId], references: [id], onDelete: NoAction)
+  rescheduledFrom Consultation?  @relation("Reschedule", fields: [rescheduledFromConsultationId], references: [id], onDelete: NoAction)
+  rescheduledTo   Consultation[] @relation("Reschedule")
+
+  files              PatientFile[]
+  reportRequests     ReportRequest[]
+  blockingDoctor     Doctor[]                  @relation("CompletionGate")
+  payment            Payment?
+  instantOffers      InstantConsultancy[]
+  participants       ConsultationParticipant[]
+  clarificationCases ClarificationCase[]
+  complaints         Complaint[]
+  clinicalRecord     ClinicalRecord?
+  followupPathway    FollowupPathway?          @relation(fields: [followupPathwayId], references: [id], onDelete: NoAction)
+  checkinResponses   CheckinResponse[]
+  safetyAlerts       SafetyAlert[]
+
+  @@index([patientId, status])
+  @@index([doctorId, status])
+  @@index([doctorId, scheduledStartAt])
+  @@index([status, scheduledStartAt])
+  @@index([followupStatus, followupStartsOn])
+  @@index([holdExpiresAt])
+  @@map("consultations")
+}
+
+// ---------------------------------------------------------------------------
+// M-12 Payments and Billing. Owns `payments` - one row per consultation,
+// carrying the frozen bill, the refund and the payout.
+//
+// *** THE BILL IS FROZEN AT CHECKOUT. *** The rates are stored beside the
+// amounts, not just the amounts: FR-7.3 prints "convenience fee 20%" on the
+// bill, and `app_config` may have moved on since. Changing a specialty fee or a
+// GST rate must never rewrite an invoice somebody has already paid (FR-7.9).
+//
+// What is DERIVED, and therefore not stored:
+//   subtotal      = consultation_fee + convenience_fee
+//   total_payable = consultation_fee + convenience_fee + gst_amount
+//   payout_amount = consultation_fee          (the deduction is always zero)
+//   payout_status = payout_paid_at IS NULL ? pending : paid
+//
+// There is no gateway events table. Replay safety is the unique
+// `gateway_payment_id` and `gateway_refund_id`, with raw payloads written to
+// the audit log.
+// ---------------------------------------------------------------------------
+
+enum PaymentStatus {
+  created
+  pending
+  paid
+  failed
+  refunded
+
+  @@map("payment_status")
+}
+
+model Payment {
+  id             String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  /// One bill per consultation. The unique is what makes that true.
+  consultationId String @unique @map("consultation_id") @db.Uuid
+
+  /// Frozen at checkout. The provider keeps ALL of it (FR-7.4).
+  consultationFee   Decimal @map("consultation_fee") @db.Decimal(10, 2)
+  /// The RATE in force at checkout, because the bill prints the percentage.
+  convenienceFeePct Decimal @map("convenience_fee_pct") @db.Decimal(5, 2)
+  /// Stored because a rounded figure must never be recomputed.
+  convenienceFee    Decimal @map("convenience_fee") @db.Decimal(10, 2)
+  gstPct            Decimal @map("gst_pct") @db.Decimal(5, 2)
+  gstAmount         Decimal @map("gst_amount") @db.Decimal(10, 2)
+
+  status           PaymentStatus @default(created)
+  /// The order the gateway was asked to create. One per attempt.
+  gatewayOrderId   String?       @unique @map("gateway_order_id") @db.VarChar(120)
+  /// *** IDEMPOTENCY *** a replayed capture webhook finds this set and no-ops.
+  gatewayPaymentId String?       @unique @map("gateway_payment_id") @db.VarChar(120)
+  /// upi, card, netbanking, wallet (FR-7.1). Shown in payment history.
+  paymentMethod    String?       @map("payment_method") @db.VarChar(40)
+
+  paidAt        DateTime? @map("paid_at") @db.Timestamptz(6)
+  failureReason String?   @map("failure_reason") @db.VarChar(200)
+
+  refundAmount             Decimal   @default(0) @map("refund_amount") @db.Decimal(10, 2)
+  refundReason             String?   @map("refund_reason") @db.VarChar(200)
+  /// Refunds are raised from the panel only (FR-7.7).
+  refundInitiatedByAdminId String?   @map("refund_initiated_by_admin_id") @db.Uuid
+  /// *** IDEMPOTENCY *** stops a replayed refund webhook double-refunding.
+  gatewayRefundId          String?   @unique @map("gateway_refund_id") @db.VarChar(120)
+  refundedAt               DateTime? @map("refunded_at") @db.Timestamptz(6)
+
+  /// NULL until the transfer is made - this IS the payout status. Payouts are
+  /// made by the client by hand this release, so there is nothing to automate.
+  payoutPaidAt DateTime? @map("payout_paid_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  consultation Consultation @relation(fields: [consultationId], references: [id], onDelete: NoAction)
+  /// NoAction, not the default SetNull: an admin leaving must not erase who
+  /// authorised a refund. That is the record the money moved on.
+  refundedBy   Admin?       @relation("RefundInitiator", fields: [refundInitiatedByAdminId], references: [id], onDelete: NoAction)
+
+  @@index([status, createdAt])
+  @@index([paidAt])
+  @@map("payments")
+}
+
+// ---------------------------------------------------------------------------
+// M-13 Presence and Instant Consult. Owns `instant_consultancy` - ONE ROW PER
+// DOCTOR OFFERED, not one per request.
+//
+// That shape is the whole design. A request that is declined by two providers
+// and accepted by a third leaves three rows, in order, each with its own
+// outcome - so "who was asked, in what order, and what did they say" is a query
+// rather than a reconstruction. It is also the source for FR-18.6's acceptance
+// rate, which is why no counter is cached on the doctor row.
+//
+// What is NOT here:
+//   the request itself      = a `consultations` row with mode `instant` (M-11)
+//   the doctor's live state = `doctors.presence` (M-05)
+//   the completion gate     = `doctors.blocked_by_consultation_id` (M-05)
+//   no responded_at         = the acceptance rate counts outcomes, and response
+//                             latency is not a figure any screen reports
+// ---------------------------------------------------------------------------
+
+enum InstantConsultancyOutcome {
+  /// Offered, and the window has not closed yet.
+  pending
+  accepted
+  declined
+  timed_out
+  /// Another provider accepted first, so this offer no longer stands.
+  superseded
+
+  @@map("instant_consultancy_outcome")
+}
+
+model InstantConsultancy {
+  id             String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  consultationId String @map("consultation_id") @db.Uuid
+  doctorId       String @map("doctor_id") @db.Uuid
+
+  /// Routing order. 1 is the first provider tried.
+  attemptNumber Int                       @map("attempt_number") @db.SmallInt
+  outcome       InstantConsultancyOutcome @default(pending)
+
+  offeredAt DateTime @default(now()) @map("offered_at") @db.Timestamptz(6)
+  /// The acceptance window (FR-10.6). Its length is an `app_config` value.
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
+
+  consultation Consultation @relation(fields: [consultationId], references: [id], onDelete: Cascade)
+  doctor       Doctor       @relation(fields: [doctorId], references: [id], onDelete: NoAction)
+
+  @@unique([consultationId, attemptNumber])
+  @@index([doctorId, outcome])
+  @@index([expiresAt])
+  @@map("instant_consultancy")
+}
+
+// ---------------------------------------------------------------------------
+// M-14 Video Consultation. Owns `consultation_participants` - ONE ROW PER
+// CONNECTION, not one per person and not one per call.
+//
+// That shape is forced by how LiveKit reports. It fires `participant_joined`
+// and `participant_left` per CONNECTION, and a phone that loses signal halfway
+// through a consultation produces several of each. The four timestamps this
+// replaced - patient_joined_at, patient_left_at, doctor_joined_at,
+// doctor_left_at - could hold only the first join and the last leave, so a
+// reconnect silently overwrote the session it was resuming.
+//
+// The primary key is LiveKit's participant SID rather than a uuid of our own.
+// LiveKit generates it per connection and never reuses it, which is what makes
+// a redelivered webhook a no-op instead of a doubled call duration.
+//
+// What is NOT here:
+//   the room            = its NAME is a pure function of `consultations.id`
+//   the join token      = it lives for minutes; its ISSUE is an `audit_log` row
+//   the server url      = one deployment, one LIVEKIT_URL in the environment
+//   call duration       = the summed join/leave intervals of these rows
+//   session start/end   = min(joined_at) and max(left_at)
+//   who failed to show  = the party with NO row here
+//   patient_id/doctor_id = both are on the consultation this hangs from
+//   any recording       = FR-8.6. Nothing is recorded, so there is nothing to
+//                         point at, no retention period and no egress config
+// ---------------------------------------------------------------------------
+
+model ConsultationParticipant {
+  /// LiveKit's `PA_xxx`, unique per CONNECTION. Being the key is the whole of
+  /// the webhook's idempotency: the second delivery collides and changes nothing.
+  livekitParticipantSid String @id @map("livekit_participant_sid") @db.VarChar(64)
+
+  /// Parsed back out of the room name, which is a function of this id.
+  consultationId String @map("consultation_id") @db.Uuid
+
+  /// Patient or doctor only - nobody else is ever issued a join token, and a
+  /// CHECK in the migration says so. WHICH patient and WHICH doctor is on the
+  /// consultation row, so naming the party repeats neither foreign key.
+  party Party
+
+  /// From the `participant_joined` webhook.
+  joinedAt DateTime  @map("joined_at") @db.Timestamptz(6)
+  /// From `participant_left`. Null means still connected - or that the webhook
+  /// never arrived, which is why nothing computes a duration from a null.
+  leftAt   DateTime? @map("left_at") @db.Timestamptz(6)
+
+  /// LiveKit's DisconnectReason verbatim (CLIENT_INITIATED, DUPLICATE_IDENTITY,
+  /// ROOM_DELETED...). NOT an enum: LiveKit owns this vocabulary and adds to
+  /// it, and a value we had not heard of must land in the row rather than fail
+  /// the webhook. It is the only thing separating a hang-up from a dropped
+  /// network when a technical-issue complaint or a refund is adjudicated.
+  disconnectReason String? @map("disconnect_reason") @db.VarChar(40)
+
+  consultation Consultation @relation(fields: [consultationId], references: [id], onDelete: Cascade)
+
+  @@index([consultationId, party, joinedAt])
+  @@map("consultation_participants")
+}
+
+// ---------------------------------------------------------------------------
+// M-15 Clinical Records. Owns `clinical_records` - ONE row per consultation.
+//
+// It is a table of its own rather than columns on `consultations` because it
+// FREEZES. `finalised_at` is the moment the clinical record becomes evidence:
+// nothing on it may change afterwards, while the consultation row goes on
+// changing for a week of follow-up. Two lifetimes cannot share one row.
+//
+// `finalised_at` ALONE carries draft-or-final. There is no status column
+// beside it, because a two-state lifecycle is carried by its timestamp and a
+// second field could disagree with it.
+//
+// What is NOT here:
+//   patient_id / doctor_id      = read through the consultation, 1:1 with this
+//   status                      = `finalised_at IS NULL` is the draft state
+//   pdf_file_id                 = the `patient_files` row for this consultation
+//                                 with file_category `prescription_pdf`, kept
+//                                 single by a partial unique index
+//   referral_advised            = a written `referral_note` IS the advice
+//   has_clinical_doubt          = a doubt IS a `clarification_cases` row (M-17)
+//   clinically_completed_at     = this row's `finalised_at`, read through here
+// ---------------------------------------------------------------------------
+
+/// FR-11.1. Drives the follow-up pathway M-16 assigns and the urgency an admin
+/// sees on the governance list.
+enum RiskCategory {
+  low
+  moderate
+  high
+
+  @@map("risk_category")
+}
+
+model ClinicalRecord {
+  id             String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  /// One record per consultation. The unique is what makes that true.
+  consultationId String @unique @map("consultation_id") @db.Uuid
+
+  /// FR-11.1's mandatory notes.
+  chiefComplaint         String       @map("chief_complaint")
+  clinicalHistory        String?      @map("clinical_history")
+  diagnosis              String?
+  /// A provisional diagnosis is the norm in a first teleconsultation, so this
+  /// defaults to true: the safer of the two to state by accident.
+  isDiagnosisProvisional Boolean      @default(true) @map("is_diagnosis_provisional")
+  riskCategory           RiskCategory @map("risk_category")
+
+  /// Set = a referral WAS advised, and this is what for. There is no separate
+  /// `referral_advised` flag: advising one without saying what for was never
+  /// useful, and a flag beside the note could contradict it.
+  referralNote String? @map("referral_note") @db.VarChar(255)
+
+  /// Medicine lines: id, name, dose, frequency, duration, instructions,
+  /// genericName, route, quantity. `id` is a client-tracking uuid assigned on
+  /// save, not a row key.
+  ///
+  /// A jsonb array rather than a table because nothing ever queries ACROSS
+  /// prescriptions - a line is only ever read as part of the record it belongs
+  /// to, and it freezes with it. MUST stay empty unless the treating provider's
+  /// specialty has `can_prescribe`; a CHECK cannot see the specialty, so the
+  /// service enforces it and its test is the proof.
+  medicines Json @default("[]")
+
+  /// The advice and therapy plan, written by EVERY professional - it is the
+  /// closing record for one who cannot prescribe, and it sits beside the
+  /// medicines for one who can. Four columns rather than one blob because the
+  /// patient Care Plan renders each under its own heading (FR-14.1).
+  adviceCovered      String? @map("advice_covered")
+  adviceHomePractice String? @map("advice_home_practice")
+  adviceNextFocus    String? @map("advice_next_focus")
+  /// Surfaced on the patient's Care Plan, and read by M-16's safety rules.
+  adviceWarningSigns String? @map("advice_warning_signs")
+
+  /// FR-11.3. Three to five lines, required before this record can be finalised.
+  caseSummary           String? @map("case_summary")
+  /// FR-15.4: the Care Hub items the doctor picked for this patient. Ids into
+  /// `content_items`, not copies of them - the article may be revised later and
+  /// the patient should get the current text.
+  recommendedContentIds Json    @default("[]") @map("recommended_content_ids")
+
+  /// *** THE COMPLETION GATE (FR-11.5). *** Null = still a draft. Setting it
+  /// requires a case summary plus either a medicine or the advice plan, and the
+  /// same transaction closes the consultation and opens M-13's instant gate.
+  finalisedAt DateTime? @map("finalised_at") @db.Timestamptz(6)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  consultation Consultation @relation(fields: [consultationId], references: [id], onDelete: Cascade)
+
+  @@index([finalisedAt])
+  @@map("clinical_records")
+}
+
+// ---------------------------------------------------------------------------
+// M-16 Follow-Up and Patient Safety. Owns `followup_pathways`,
+// `checkin_responses` and `safety_alerts`.
+//
+// The platform's differentiator, which is why the rules live in the database
+// and stay editable by an admin rather than being written into an app release.
+//
+// The ASSIGNMENT of a pathway to a patient is columns on the consultation -
+// `followup_pathway_id`, `followup_starts_on`, `followup_status` and
+// `extra_checkin_questions` - because it is an attribute of that episode of
+// care, not a row of its own.
+//
+// What is NOT here:
+//   followup_ends_on   = starts_on + the PINNED pathway's duration_days
+//   triggered_rules    = the answers plus the pinned pathway version reproduce
+//                        exactly which rules fired; the alert carries the reason
+//   patient_id/doctor_id on the children = read through the consultation
+//   alert status       = `acknowledged_at` and `closed_at` ARE the status
+//   published_at       = `is_current` decides what new assignments get
+// ---------------------------------------------------------------------------
+
+/// FR-13.2 to FR-13.4. Green continues, amber prompts review, red shows
+/// emergency guidance at once and alerts the doctor and an admin.
+enum CheckinStatus {
+  green
+  amber
+  red
+
+  @@map("checkin_status")
+}
+
+/// Exactly FR-9.8's five. A sixth would be a screen nobody has designed.
+enum SafetyAlertType {
+  red_flag
+  amber
+  missed_checkin
+  medication_side_effect
+  followup_due
+
+  @@map("safety_alert_type")
+}
+
+/**
+ * A question set and its red-flag rules, VERSIONED WHOLE.
+ * Versioned whole rather than per question because a patient part-way through
+ * a seven-day follow-up must keep answering the set they started on: changing
+ * a question under them would make yesterday's answer and today's answer to
+ * "the same" question incomparable, and the red-flag rules are read back later
+ * to explain why an alert fired. `consultations.followup_pathway_id` pins the
+ * version; `is_current` only decides what a NEW assignment gets.
+ */
+model FollowupPathway {
+  id      String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  /// depression_anxiety, sleep, substance_use, bipolar_psychosis, general.
+  code    String @db.VarChar(60)
+  name    String @db.VarChar(120)
+  version Int    @default(1) @db.SmallInt
+
+  /// The follow-up window. `followup_starts_on` plus this IS the end date, so
+  /// no consultation stores one.
+  durationDays Int @default(7) @map("duration_days") @db.SmallInt
+
+  /// The ordered question set. Each option carries the status it contributes,
+  /// which is what makes the routine green/amber grading data rather than code.
+  questions    Json
+  /// FR-13.5's conditions, which FORCE red whatever the options say. Separate
+  /// from the questions because these are the clinician-approved safety rules
+  /// that must fire identically for every patient (FR-13.7), and because each
+  /// carries the plain-words reason the resulting alert is raised with.
+  redFlagRules Json @map("red_flag_rules")
+
+  /// What a NEW assignment gets. Never what an in-flight one follows.
+  isCurrent Boolean  @default(false) @map("is_current")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  consultations Consultation[]
+
+  @@unique([code, version])
+  @@index([code, isCurrent])
+  @@map("followup_pathways")
+}
+
+/// One row per patient per day. A MISSING row past its date is what raises a
+/// missed check-in - absence is the signal, so nothing records "not answered".
+model CheckinResponse {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  consultationId String   @map("consultation_id") @db.Uuid
+  checkinDate    DateTime @map("checkin_date") @db.Date
+
+  /// Keyed to the PINNED pathway's question set, plus any the doctor added for
+  /// this patient alone.
+  answers Json
+  status  CheckinStatus
+
+  submittedAt DateTime @default(now()) @map("submitted_at") @db.Timestamptz(6)
+
+  consultation Consultation  @relation(fields: [consultationId], references: [id], onDelete: Cascade)
+  alerts       SafetyAlert[]
+
+  @@unique([consultationId, checkinDate])
+  @@index([status, submittedAt])
+  @@map("checkin_responses")
+}
+
+/// FR-13.4 and FR-9.8. A red status alerts BOTH the treating doctor and admins
+/// at care-coordinator or clinical-governance level.
+model SafetyAlert {
+  id        String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  alertType SafetyAlertType @map("alert_type")
+
+  consultationId    String  @map("consultation_id") @db.Uuid
+  /// Null for an alert that no single check-in produced - a missed one, or a
+  /// follow-up falling due.
+  checkinResponseId String? @map("checkin_response_id") @db.Uuid
+
+  /// Why it fired, in plain words, taken from the rule that fired it. NEVER
+  /// names a diagnosis: this is read on a lock screen and in an admin queue.
+  reason String? @db.VarChar(255)
+
+  /// Either an admin or the treating doctor, never both - a CHECK enforces it.
+  acknowledgedByAdminId  String?   @map("acknowledged_by_admin_id") @db.Uuid
+  acknowledgedByDoctorId String?   @map("acknowledged_by_doctor_id") @db.Uuid
+  /// These two timestamps ARE the status: both null is open, the first set is
+  /// acknowledged, the second set is closed.
+  acknowledgedAt         DateTime? @map("acknowledged_at") @db.Timestamptz(6)
+  closedAt               DateTime? @map("closed_at") @db.Timestamptz(6)
+  closingNote            String?   @map("closing_note")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  consultation         Consultation     @relation(fields: [consultationId], references: [id], onDelete: Cascade)
+  checkinResponse      CheckinResponse? @relation(fields: [checkinResponseId], references: [id], onDelete: Cascade)
+  /// NoAction, not SetNull: an admin leaving must not erase who took
+  /// responsibility for a safety alert.
+  acknowledgedByAdmin  Admin?           @relation("AlertAcknowledgedByAdmin", fields: [acknowledgedByAdminId], references: [id], onDelete: NoAction)
+  acknowledgedByDoctor Doctor?          @relation("AlertAcknowledgedByDoctor", fields: [acknowledgedByDoctorId], references: [id], onDelete: NoAction)
+
+  @@index([alertType, createdAt])
+  @@index([consultationId])
+  @@map("safety_alerts")
+}
+
+// ---------------------------------------------------------------------------
+// M-17 Case Clarification. Owns `clarification_cases` - one row per case,
+// carrying the de-identified snapshot, the single expert assignment and the
+// discussion thread.
+//
+// *** TWO INDEPENDENT CHECKS (FR-12.4). ***
+//   `doctors.seniority_level = expert`  says WHO MAY BE ASKED
+//   `expert_doctor_id` on this row      says WHAT THEY MAY SEE
+// Eligibility alone never grants visibility. An expert with no assignment on a
+// case cannot see it, however senior they are.
+//
+// *** DE-IDENTIFICATION IS STRUCTURAL (FR-12.2). *** There is nowhere here to
+// put a name, a phone number, an address or an email: the snapshot carries an
+// age and a gender and nothing else that could identify anybody. Attachments
+// are `patient_files` rows carrying a `clarification_case_id`, and M-10's CHECK
+// forbids such a row from carrying a `patient_id` - so a case attachment cannot
+// be joined back to a person even by mistake.
+//
+// What is NOT here:
+//   the patient          = never referenced. `source_consultation_id` is for the
+//                          treating doctor and the audit trail ONLY
+//   viewed_at            = the status enum already carries awaiting_response
+//   responded_at         = the expert's reply is a `messages` entry with its own
+//                          `at`, and there can be more than one
+//   which admin assigned = the `audit_log` row. An assignment is a decision.
+//   anything patient-facing = FR-12.7. Nothing here reaches the patient, ever.
+// ---------------------------------------------------------------------------
+
+/// FR-12.6's seven, in the order a case moves through them.
+enum ClarificationStatus {
+  /// The treating doctor is still writing it. Nobody else can see it at all.
+  draft
+  /// Submitted, waiting for an admin to choose an expert.
+  posted
+  /// An expert has it.
+  awaiting_response
+  /// The expert has answered.
+  response_received
+  /// The expert needs something more before they can answer.
+  clarification_asked
+  /// The treating doctor has read and considered the advice.
+  reviewed
+  closed
+
+  @@map("clarification_status")
+}
+
+/// Drives the expert queue. Never a clinical severity - that is the case text.
+enum ClarificationUrgency {
+  routine
+  soon
+  urgent
+
+  @@map("clarification_urgency")
+}
+
+model ClarificationCase {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  treatingDoctorId     String  @map("treating_doctor_id") @db.Uuid
+  /// *** NEVER EXPOSED TO THE REVIEWER. *** For the treating doctor and the
+  /// audit trail only: it is the one link back to a patient, and the expert's
+  /// view is built without ever reading it.
+  sourceConsultationId String? @map("source_consultation_id") @db.Uuid
+
+  /// FR-12.3's fields. Name, phone, address and email are never written here
+  /// because there is no column for them: age and gender are the only patient
+  /// attributes a reviewer needs, and neither identifies anybody alone.
+  title         String               @db.VarChar(200)
+  /// Free-text guidance area, e.g. "drug interaction". Not an FR-12.3 field -
+  /// scanned by the same de-identification pass as `title`/`briefHistory`.
+  topic         String?              @db.VarChar(120)
+  patientAge    Int?                 @map("patient_age") @db.SmallInt
+  patientGender Gender?              @map("patient_gender")
+  briefHistory  String               @map("brief_history")
+  diagnosis     String?
+  currentPlan   String?              @map("current_plan")
+  specificDoubt String               @map("specific_doubt")
+  urgency       ClarificationUrgency @default(routine)
+
+  /// The ONE expert who may see this. Must be a doctor at `expert` seniority -
+  /// the service checks that, because a foreign key cannot express it.
+  expertDoctorId String?   @map("expert_doctor_id") @db.Uuid
+  /// Drives the urgency queue. WHICH admin assigned it is the `audit_log` row,
+  /// because an assignment is a decision rather than an attribute of the case.
+  assignedAt     DateTime? @map("assigned_at") @db.Timestamptz(6)
+
+  /// The discussion, appended to atomically. Oldest first, each entry carrying
+  /// its own author, kind and time.
+  messages Json @default("[]")
+
+  status   ClarificationStatus @default(draft)
+  postedAt DateTime?           @map("posted_at") @db.Timestamptz(6)
+  closedAt DateTime?           @map("closed_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// NoAction on both doctors: a case is the record of a clinical question that
+  /// was asked and answered, and neither party leaving may erase it.
+  treatingDoctor Doctor        @relation("TreatingDoctor", fields: [treatingDoctorId], references: [id], onDelete: NoAction)
+  expertDoctor   Doctor?       @relation("ExpertDoctor", fields: [expertDoctorId], references: [id], onDelete: NoAction)
+  /// SetNull, unlike the doctors. If the consultation is erased under SRS 6.4
+  /// the case must survive WITHOUT its one link back to a patient - which is
+  /// the same de-identified state a reviewer always saw.
+  consultation   Consultation? @relation(fields: [sourceConsultationId], references: [id], onDelete: SetNull)
+
+  /// De-identified copies. M-10's CHECK forbids these rows a `patient_id`.
+  attachments PatientFile[]
+
+  @@index([treatingDoctorId, status])
+  @@index([expertDoctorId, status])
+  @@index([status, urgency])
+  @@map("clarification_cases")
+}
+
+// ---------------------------------------------------------------------------
+// M-18 Care Hub. Owns `content_items` - ONE table for seven kinds of content,
+// separated by `item_type`.
+//
+// One table rather than seven because they differ only in what they are FOR.
+// A self-help tool, an education module, a blog, a caregiver guide, the
+// emergency guidance, an NGO listing and a specialty red-flag reference all
+// have a title, a summary, a body and a review status, and all move through the
+// same authoring and clinical-review workflow. Seven tables would be the same
+// six columns copied seven times, and seven admin screens to keep in step.
+//
+// *** THE REVIEW STATUS IS THE POINT (FR-15.3). *** Content is written by an
+// admin and CLINICALLY REVIEWED before a patient ever sees it, and none of it
+// needs an app release. `published` is the only status a patient-facing read
+// ever matches.
+//
+// What is NOT here:
+//   no locale        = a multilingual app is Phase 3 (SRS 11); every row is in
+//                      the launch language
+//   no published_at  = `review_status = published` says it, and `sort_order`
+//                      plus `created_at` order the shelf
+//   no cover mime    = the cover is one admin-uploaded image and the object
+//                      store types it
+//   no clinical data = FR-15.4's recommendations are a list on the CLINICAL
+//                      RECORD, not rows here. This library knows nothing about
+//                      any patient, which is what lets it be read without one.
+//   no comments, no likes, no forum = FR-15.8. There is no peer-content table
+//                      because there is no peer content.
+// ---------------------------------------------------------------------------
+
+/// FR-15.1 to FR-15.7's seven kinds, and M-06's red-flag references.
+enum ContentItemType {
+  /// FR-15.1: breathing, grounding, sleep hygiene, activity scheduling,
+  /// craving diary, medication adherence.
+  self_help_tool
+  /// FR-15.2: the condition-wise education library.
+  education_module
+  /// FR-15.3: clinician-reviewed awareness writing.
+  blog_article
+  /// FR-15.5: shareable with the patient's consent.
+  caregiver_guide
+  /// FR-15.7 and SRS 6.3. Persistent, and reachable from everywhere.
+  emergency_guidance
+  /// FR-15.6: curated helplines and NGOs, with `is_verified_org` shown.
+  support_org
+  /// M-06's specialty red-flag references. Rows here rather than columns on the
+  /// specialty, because they are content that needs reviewing like any other.
+  clinical_reference
+
+  @@map("content_item_type")
+}
+
+/// Authoring, clinical review, publication and retirement.
+enum ContentReviewStatus {
+  draft
+  /// With the client's clinician. FR-15.3's "clinician-reviewed" is this state
+  /// having been passed through, not a checkbox somebody ticked.
+  in_clinical_review
+  /// The ONLY status a patient-facing read matches.
+  published
+  /// Retired. Kept, not deleted: a doctor may have recommended it last week,
+  /// and a Care Plan pointing at a row that no longer exists is a broken link.
+  archived
+
+  @@map("content_review_status")
+}
+
+model ContentItem {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  itemType ContentItemType @map("item_type")
+  /// Stable, human-readable, and unique. What a deep link and a support script
+  /// name an item by, so a re-titled article keeps its address.
+  slug     String          @unique @db.VarChar(160)
+  title    String          @db.VarChar(200)
+  summary  String?         @db.VarChar(400)
+
+  /// Structured blocks. For `support_org` this holds the phone, address and
+  /// timings FR-15.6 asks for - a shape that suits one item type only, which is
+  /// why it is in the body rather than seven mostly-null columns on the row.
+  body Json
+
+  /// FR-15.2's condition-wise shelving, and what a doctor filters by.
+  concernId   String? @map("concern_id") @db.Uuid
+  /// Used by `clinical_reference`, which is shelved by specialty rather than
+  /// by the concern a patient would recognise.
+  specialtyId String? @map("specialty_id") @db.Uuid
+
+  /// An admin-uploaded cover, held as a STORAGE KEY rather than a
+  /// `patient_files` row: content media is public and has no patient owner, so
+  /// it must not go through the patient-ownership guard that protects a
+  /// patient's own documents.
+  coverStorageKey String? @map("cover_storage_key")
+
+  /// `support_org` only. FR-15.6 requires verification to be shown AND filtered
+  /// on, so it is a column rather than a key inside `body`.
+  isVerifiedOrg Boolean? @map("is_verified_org")
+
+  reviewStatus      ContentReviewStatus @default(draft) @map("review_status")
+  /// The clinical reviewer is the CLIENT, not the developer (SRS 8).
+  reviewedByAdminId String?             @map("reviewed_by_admin_id") @db.Uuid
+  reviewedAt        DateTime?           @map("reviewed_at") @db.Timestamptz(6)
+
+  /// Hand-set shelf order. Ties break on `created_at`.
+  sortOrder Int @default(0) @map("sort_order") @db.SmallInt
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  concern    Concern?   @relation(fields: [concernId], references: [id], onDelete: SetNull)
+  specialty  Specialty? @relation(fields: [specialtyId], references: [id], onDelete: SetNull)
+  /// NoAction: an admin leaving must not erase who signed a piece of clinical
+  /// content off. That is the record the review rests on.
+  reviewedBy Admin?     @relation("ContentReviewer", fields: [reviewedByAdminId], references: [id], onDelete: NoAction)
+
+  @@index([itemType, reviewStatus])
+  @@index([concernId, itemType])
+  @@map("content_items")
+}
+
+// ---------------------------------------------------------------------------
+// M-19 Feedback and Complaints. Owns `complaints`, with the message thread on
+// the row.
+//
+// Post-consult FEEDBACK is not here: it is `feedback_rating` and
+// `feedback_comment` on the consultation, because a rating is an attribute of
+// that appointment rather than a record with a life of its own. It has no
+// workflow, no thread and no assignee - it is submitted once and read in
+// aggregate.
+//
+// A COMPLAINT is the opposite: it has four states, an assignee, a conversation
+// and an outcome somebody has to stand behind, which is why it is a table.
+//
+// What is NOT here:
+//   no feedback table    = two columns on the consultation say it all
+//   no feedback_at       = a rating being SET is the fact that it was given
+//   no closed_at         = `resolved_at` plus the status carries the outcome,
+//                          and a rejected complaint is not a resolved one
+//   no separate internal-notes table = an internal note is a message with
+//                          `isInternal`, so the conversation stays in one
+//                          ordered thread instead of two that interleave badly
+// ---------------------------------------------------------------------------
+
+/// FR-18.8's workflow. Four states, and `rejected` is NOT `resolved`.
+enum ComplaintStatus {
+  open
+  in_progress
+  /// Something was done about it.
+  resolved
+  /// Considered and declined. A terminal state of its own, because "we looked
+  /// and disagreed" is a different outcome from "we fixed it" - and a patient
+  /// is owed the distinction.
+  rejected
+
+  @@map("complaint_status")
+}
+
+/// What the complaint is about. Drives routing and the FR-18.6 breakdown.
+enum ComplaintCategory {
+  consultation_quality
+  doctor_conduct
+  technical_issue
+  payment_issue
+  other
+
+  @@map("complaint_category")
+}
+
+model Complaint {
+  id            String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  /// The ticket number the patient quotes to support. `CX-` rather than the
+  /// `CC-` of a consultation, so somebody reading a code down a phone line
+  /// knows which of the two they have been given.
+  referenceCode String @unique @map("reference_code") @db.VarChar(24)
+
+  patientId      String  @map("patient_id") @db.Uuid
+  /// Null when the complaint is not about one consultation - a billing problem,
+  /// or the app itself.
+  consultationId String? @map("consultation_id") @db.Uuid
+
+  category    ComplaintCategory
+  subject     String            @db.VarChar(200)
+  description String
+
+  status            ComplaintStatus @default(open)
+  /// Who is working it. Null means nobody has picked it up yet, which is
+  /// exactly what the unassigned queue is.
+  assignedToAdminId String?         @map("assigned_to_admin_id") @db.Uuid
+
+  /// The conversation. Each entry carries `isInternal`, so an admin can think
+  /// out loud on the ticket without the patient reading it - and the patient
+  /// view filters on that one flag rather than on a second table.
+  messages Json @default("[]")
+
+  /// Set ONLY when resolved. A rejected complaint has an outcome but not a
+  /// resolution, and conflating the two would make "how many did we resolve"
+  /// unanswerable.
+  resolvedAt     DateTime? @map("resolved_at") @db.Timestamptz(6)
+  /// Why it ended the way it did. Required for BOTH terminal states: a patient
+  /// told only "rejected" has been dismissed rather than answered.
+  resolutionNote String?   @map("resolution_note")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  patient      Patient       @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  /// NoAction, unlike the patient. A complaint about a consultation must not
+  /// disappear because the consultation was tidied away - it is often the
+  /// evidence for a refund.
+  consultation Consultation? @relation(fields: [consultationId], references: [id], onDelete: NoAction)
+  /// NoAction: an admin leaving must not erase who was handling a complaint.
+  assignedTo   Admin?        @relation("ComplaintAssignee", fields: [assignedToAdminId], references: [id], onDelete: NoAction)
+
+  @@index([status, createdAt])
+  @@index([patientId])
+  @@map("complaints")
+}
