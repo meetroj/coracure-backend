@@ -1,0 +1,29 @@
+# Never bake secrets or a developer's machine into the image.
+.env
+.env.*
+!.env.example
+
+node_modules
+dist
+coverage
+*.tsbuildinfo
+
+.git
+.gitignore
+.vscode
+.idea
+
+# Docs and local tooling are not needed to run the service.
+docs
+db
+README.md
+docker-compose.yml
+dbml-error.log
+**/*.spec.ts
+**/*.e2e-spec.ts
+test
+vitest.config.mts
+vitest.e2e.config.mts
+eslint.config.mjs
+.prettierrc.json
+.prettierignore

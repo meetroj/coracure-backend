@@ -1,0 +1,62 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: coracure
+      POSTGRES_USER: coracure
+      POSTGRES_PASSWORD: coracure
+    ports:
+      - '${POSTGRES_PORT:-5432}:5432'
+    volumes:
+      - coracure_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U coracure -d coracure']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - '${REDIS_PORT:-6379}:6379'
+    volumes:
+      - coracure_redis:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # M-14 the media plane. A SEPARATE server from the API, on purpose: audio and
+  # video go client <-> here <-> client and never through Nest, which only mints
+  # the join tokens (LiveKit_strategy 2).
+  #
+  # Not behind a healthcheck-gated `depends_on` from anything: the API is
+  # perfectly healthy with no LiveKit running, it simply cannot start a call.
+  livekit:
+    image: livekit/livekit-server:v1.9
+    command: --config /etc/livekit.yaml
+    volumes:
+      - ./livekit/livekit.yaml:/etc/livekit.yaml:ro
+    ports:
+      # Signalling and the webhook source. Also what LIVEKIT_URL points at.
+      - '${LIVEKIT_PORT:-7880}:7880'
+      # WebRTC over TCP, for networks that will not pass UDP at all.
+      - '${LIVEKIT_TCP_PORT:-7881}:7881'
+      # The UDP media range, kept to 20 ports locally - compose publishes each
+      # one individually, so production's 50000-60000 would be 10,000 forwards.
+      # On EC2 this is a security-group rule and the full range is opened.
+      - '50000-50019:50000-50019/udp'
+    # The container reaches the API on the host to deliver its webhooks. Linux
+    # does not resolve `host.docker.internal` on its own; Desktop already does.
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://localhost:7880']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  coracure_postgres:
+  coracure_redis:

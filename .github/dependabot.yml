@@ -1,0 +1,38 @@
+version: 2
+
+updates:
+  # Grouped so a week's patches are one review rather than thirty. Major bumps
+  # stay separate: `npm ci` is pinned to a lock file npm 11 wrote, Prisma majors
+  # carry migration-engine changes, and Nest majors move across the whole tree -
+  # none of those belong in a batch somebody skims.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      production-patch:
+        dependency-type: production
+        update-types: [patch]
+      development:
+        dependency-type: development
+        update-types: [minor, patch]
+    ignore:
+      - dependency-name: '*'
+        update-types: [version-update:semver-major]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ['*']
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday

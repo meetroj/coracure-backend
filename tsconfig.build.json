@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "./src",
+    // Inside `outDir`, so `deleteOutDir` in nest-cli.json clears the cache with
+    // the output it describes. Left at its default this lands in the project
+    // ROOT (`rootDir` moves it out of `dist`), and a build after anything
+    // removes `dist` - `deleteOutDir` itself, a clean, a stale checkout - reads
+    // a cache that says every file is already emitted and writes NOTHING, with
+    // exit code 0. The failure surfaces later and somewhere else, as
+    // `start:prod` or a container with no `dist/main.js`.
+    "tsBuildInfoFile": "./dist/tsconfig.build.tsbuildinfo"
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "test", "dist", "**/*.spec.ts", "**/*.e2e-spec.ts"]
+}

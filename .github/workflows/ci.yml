@@ -1,0 +1,279 @@
+# Coracure API - continuous integration.
+#
+# Every gate here corresponds to something the module plan calls a completion
+# criterion (MODULES section 4): the rules are unit tested, the main paths are
+# integration tested, and the migrations are "written, applied and repeatable on
+# a clean database". The image job proves the artefact that ships actually boots
+# and, just as importantly, refuses to boot on a bad configuration.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A second push to the same branch cancels the first. Never cancel on main -
+# that run is what the release gates on.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  # node:22 ships npm 10, which cannot install this lock file - it reports
+  # transitive dev packages missing because npm 11 records their nesting
+  # differently. `engines.npm` records the requirement; the Dockerfile does the
+  # same thing for the same reason.
+  NPM_VERSION: '11'
+  NODE_VERSION: '22'
+
+jobs:
+  quality:
+    name: Lint, types and unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm install -g npm@${{ env.NPM_VERSION }}
+
+      # `postinstall` runs `prisma generate`, which needs no database.
+      - run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # No database and no environment: the unit suite loads no `.env` (only
+      # `main.ts` and `prisma.config.ts` import dotenv, and neither is imported
+      # by a spec), so anything that needs a live dependency belongs in e2e.
+      - name: Unit tests
+        run: npm run test:coverage
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+          retention-days: 7
+
+  e2e:
+    name: End-to-end tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm install -g npm@${{ env.NPM_VERSION }}
+      - run: npm ci
+
+      - name: E2E tests
+        run: npm run test:e2e
+
+  migrations:
+    name: Migrations on a clean database
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: coracure
+          POSTGRES_USER: coracure
+          POSTGRES_PASSWORD: coracure
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U coracure -d coracure"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://coracure:coracure@localhost:5432/coracure
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm install -g npm@${{ env.NPM_VERSION }}
+      - run: npm ci
+
+      # The completion criterion is "repeatable on a clean database", so this
+      # runs against an empty one every time.
+      - name: Apply migrations
+        run: npm run db:migrate
+
+      # Catches the failure mode migrations cannot: someone edits
+      # `schema.prisma` and forgets the migration.
+      #
+      # The direction matters, and a plain `--exit-code` is WRONG here. The
+      # migrations deliberately add constraints Prisma's schema language cannot
+      # express - they sit under a heading that says so - a GIN index on the
+      # `languages` jsonb, a composite unique on `legal_documents`, and the
+      # composite foreign key that makes a consent's `document_type` match the
+      # document it points at. The database is a SUPERSET of the datamodel on
+      # purpose, so `--exit-code` fails every run for constraints we want.
+      #
+      # This diff runs from the database TO the datamodel, so:
+      #   `[-]` the database has something the datamodel does not - the
+      #         deliberate extras above. Reported, never fatal.
+      #   `[+]` the datamodel has something the database does not - a schema
+      #         edit with no migration behind it. THAT is the bug, and it fails.
+      - name: Fail on schema drift
+        run: |
+          set -uo pipefail
+          diff=$(npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma)
+          echo "$diff"
+          if printf '%s' "$diff" | grep -qE '^\s*\[\+\]'; then
+            echo "::error::The datamodel declares something the migrations do not build. Write the migration."
+            exit 1
+          fi
+          if printf '%s' "$diff" | grep -qE '^\s*\[-\]'; then
+            echo "::notice::The database carries constraints the datamodel cannot express. Expected - see the raw SQL in the migrations."
+          fi
+
+      # DEPLOYMENT.md promises the seed is safe to leave in a pipeline: it never
+      # overwrites an admin password and never replaces published legal copy.
+      # Running it twice is what proves that claim rather than asserting it.
+      - name: Seed, twice, to prove idempotency
+        env:
+          ADMIN_EMAIL: ci@coracure.test
+          ADMIN_PASSWORD: ci-password-not-a-secret
+        run: |
+          npm run db:seed
+          npm run db:seed
+
+  image:
+    name: Image builds, boots and refuses a bad configuration
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: [quality]
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: coracure
+          POSTGRES_USER: coracure
+          POSTGRES_PASSWORD: coracure
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U coracure -d coracure"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Loaded into the local daemon rather than pushed: a pull request must be
+      # able to run this job without any registry credential.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: coracure-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Migrations are applied by running the image itself, which is the release
+      # order DEPLOYMENT.md prescribes. If that command is broken, the release
+      # is broken, and this is where it should surface.
+      - name: Apply migrations from the image
+        run: |
+          docker run --rm --network host \
+            -e DATABASE_URL=postgresql://coracure:coracure@localhost:5432/coracure \
+            coracure-api:ci npm run db:migrate
+
+      # NODE_ENV is `production` in the image. It is overridden here on purpose:
+      # the production checks demand Slide, S3 and real LiveKit credentials, and
+      # the point of this step is the boot path, not the provider set.
+      - name: Boot the container
+        run: |
+          docker run -d --name api --network host \
+            -e NODE_ENV=development \
+            -e DATABASE_URL=postgresql://coracure:coracure@localhost:5432/coracure \
+            -e JWT_ACCESS_SECRET=ci-secret-at-least-thirty-two-chars-long \
+            coracure-api:ci
+
+      - name: Wait for readiness
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:3000/api/v1/health/ready; then
+              echo "ready after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::the container never became ready"
+          docker logs api
+          exit 1
+
+      - name: Container logs
+        if: always()
+        run: docker logs api || true
+
+      - name: Stop the container
+        if: always()
+        run: docker rm -f api || true
+
+      # M-01's completion criterion is that the service "rejects a bad
+      # configuration". A production image running the stub OTP provider would
+      # make every account signable-into with one fixed code, so the boot MUST
+      # fail. A pipeline that only proves the happy path would ship that.
+      - name: Refuse to boot a production image on the stub OTP provider
+        run: |
+          if docker run --rm --network host \
+            -e NODE_ENV=production \
+            -e OTP_PROVIDER=stub \
+            -e DATABASE_URL=postgresql://coracure:coracure@localhost:5432/coracure \
+            -e JWT_ACCESS_SECRET=ci-secret-at-least-thirty-two-chars-long \
+            coracure-api:ci; then
+            echo "::error::the service booted with OTP_PROVIDER=stub under NODE_ENV=production"
+            exit 1
+          fi
+          echo "refused, as it must"
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm install -g npm@${{ env.NPM_VERSION }}
+      - run: npm ci
+
+      # Advisory, not a gate: a transitive high in a dev dependency should be
+      # visible without being able to block a clinical fix from shipping.
+      - name: npm audit
+        continue-on-error: true
+        run: npm audit --audit-level=high
