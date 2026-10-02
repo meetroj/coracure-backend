@@ -9,11 +9,11 @@
     "npm": ">=11"
   },
   "scripts": {
-    "build": "nest build",
-    "start": "nest start",
-    "start:dev": "nest start --watch",
-    "start:debug": "nest start --debug --watch",
-    "start:prod": "node dist/main.js",
+    "build": "node init && nest build",
+    "start": "node init && nest start",
+    "start:dev": "node init && nest start --watch",
+    "start:debug": "node init && nest start --debug --watch",
+    "start:prod": "node init && node dist/main.js",
     "typecheck": "tsc --noEmit",
     "lint": "eslint \"{src,test}/**/*.ts\"",
     "lint:fix": "npm run lint -- --fix",
@@ -64,6 +64,7 @@
     "firebase-admin": "^14.3.0",
     "ioredis": "^6.0.0",
     "livekit-server-sdk": "^2.18.0",
+    "node-fetch": "^3.3.2",
     "openai": "^7.8.0",
     "passport": "^0.7.0",
     "passport-jwt": "^4.0.1",
@@ -74,7 +75,7 @@
     "rxjs": "^7.8.2",
     "socket.io": "^4.8.3",
     "tsx": "^4.23.12",
-    "zod": "^4.5.2"
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@dbml/cli": "^10.1.1",
